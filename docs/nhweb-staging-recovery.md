@@ -5,6 +5,8 @@ This fork retains Backrest and restic. It changes the branding and adds an authe
 ## Operator workflow
 
 1. **Select a snapshot** from before the incident and test the restore. The worker independently checks the pinned restic repository ID, staging tag and exact dump path. It decrypts through restic on the staging host and imports into a new database using a dedicated role without superuser, role/database creation, replication or RLS-bypass privileges. Archive code cannot use the active application's superuser identity or server-program capabilities. Imported objects keep this restricted owner; they are never reassigned to the privileged application role. The worker checks table/constraint/schema and migration compatibility, reports row counts and checksum, removes the plaintext archive, disables the recovery role's login and seals the candidate against connections.
+
+Candidate and restored-candidate validation also connects directly as that restricted role, temporarily enabling only its passwordless login for the worker's local connection and disabling it again afterward. All worker SQL pins `search_path=pg_catalog`; catalog queries and application table references are qualified. Archive-controlled views, functions or database search-path settings cannot turn validation into privileged execution.
 2. **Pause staging.** Type `PAUSE DZDISTRO STAGING`. Recovery takes the existing shared staging deployment lock, activates an independent maintenance responder for the staging hostname, verifies HTML/JSON/HEAD and `/health`/`/ready` maintenance behavior, and pauses the five exact application containers. Image, container and configuration drift refuses advancement.
 3. **Restore staging.** Type the snapshot-bound confirmation shown in the page. The worker rechecks the owned lock, fence, paused writers and database OIDs. It blocks connections to the old database and uses a transaction to rename both databases. The current database is retained as `dzdistro_before_<job>`; it is never dropped by recovery.
 4. **Reconcile queued work and cached data** using the existing staging operational tools while maintenance remains active. This workflow intentionally does not flush Redis or discard queued work automatically. The acknowledgement is required by the UI, backend and worker and recorded under the authenticated operator.
@@ -43,6 +45,10 @@ Intent, immutable container/image/config/worker identity, database OIDs and phas
 
 On a failed resume before its durable commit, containment runs before any held-journal write. The detached guard watches the worker and SSH session identities and re-pauses unchanged recorded containers after hard worker death or SSH disconnection, even when the request worker cannot write its journal. Once resume is committed, running writers are intentional and verified; a pending-cleanup state is distinct from a held recovery. If a container drifted or Docker is unavailable, an administrator must inspect writer state immediately; a held journal alone cannot prove every writer is paused.
 
+Only the independent executor can issue an unpause; the request worker sends one recorded container identity through a private local socket. The executor owns and waits for the command, and retains containment monitoring in held states for delayed or uncertain Docker outcomes. `containing` means this completion/containment is still in progress. A per-job transition mutex serializes unpause, fresh containment decisions, journal publication and durable commit; once commit wins, the guard cannot publish a stale held state or pause committed writers.
+
+Shared-lock release atomically moves the complete owned lock directory to a uniquely owned release receipt beside it. Ownership metadata is retained, including after an interrupted release. Cleanup retries verify this receipt and never remove a newly acquired foreign lock. Release receipts are small operational records and require separate eventual housekeeping.
+
 A known competing deployment lock refuses before fencing or pausing and leaves the test restore validated. Finish that deployment before trying pause again. Updating worker code/configuration during an open recovery refuses further mutation; finish recovery before upgrading it.
 
 ## Verification
@@ -65,6 +71,8 @@ docker run --rm --network none -v "$PWD/scripts:/tests:ro" --entrypoint python3 
 The `test-database-recovery` CI job runs worker refusal/failure tests and this PostgreSQL rehearsal. Full browser acceptance additionally needs the authenticated panel, restricted SSH worker, five actual paused containers and TLS maintenance routing; those are not simulated by the PostgreSQL core test.
 
 The native PostgreSQL rehearsal includes an encrypted archive with a restore-time callback attempting to truncate active staging via a server program. Validation must fail without changing active rows or OID. `scripts/test_nhws_resume_survival.py` is restricted to the labelled disposable Linux/SSH fixture: it disconnects real SSH and hard-kills the worker after each of five unpauses, checks every role independently, and injects a journal failure after a background role resumes. Unit tests also inject commit, held-journal, fence, lock and final-journal failures.
+
+The archive rehearsal additionally poisons candidate search-path/catalog resolution and defers a server-program callback until row validation. Native resume faults run both before and after each Docker effect, plus controlled containment-wins/commit-wins interleavings. Lock-release tests fail after the atomic directory move, retry cleanup and preserve a foreign replacement lock.
 
 ## Initial limits
 

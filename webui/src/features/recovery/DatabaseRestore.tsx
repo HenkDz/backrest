@@ -99,6 +99,8 @@ const descriptions: Record<string, string> = {
   "rolled-back":
     "The previous staging database is active again. Complete the resume checks before bringing staging online.",
   held: "Recovery stopped at a safety gate or an uncertain operation. Keep staging held and have an administrator inspect the recovery journal. Do not repeat the database switch.",
+  containing:
+    "The independent executor is completing containment after an interrupted resume. Keep maintenance active and refresh status; no further recovery action is available yet.",
   failed:
     "The test restore did not validate. Current staging was not replaced.",
   aborted:

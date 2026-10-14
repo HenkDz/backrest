@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """Restricted staging recovery worker. Restic remains the encryption engine."""
 import argparse
+from contextlib import contextmanager
+import fcntl
 import hashlib
 import http.server
 import json
@@ -8,6 +10,8 @@ import os
 from pathlib import Path
 import re
 import select
+import secrets
+import socket
 import subprocess
 import sys
 import time
@@ -155,24 +159,35 @@ class System:
         require(result['State']['Running'] and not result['State'].get('Paused'), 'Staging PostgreSQL is not running normally.')
         return result
 
-    def sql(self, query, database='postgres'):
+    def sql(self, query, database='postgres', role=DATABASE):
         require(self.target()['Id'] == self.target_id, 'Database container changed during recovery.')
-        return self.run(['docker', 'exec', '-i', self.target_id, 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-U', DATABASE, '-d', database, '-At', '-c', query]).decode().strip()
+        return self.run(['docker', 'exec', '-i', '-e', 'PGOPTIONS=-c search_path=pg_catalog', self.target_id, 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-U', role, '-d', database, '-At', '-c', query]).decode().strip()
 
     def oid(self, database):
         identifier(database)
         value = self.sql("SELECT oid FROM pg_database WHERE datname='" + database + "'")
         return int(value) if value else None
 
-    def validate(self, database):
-        tables = self.sql("SELECT tablename FROM pg_tables WHERE schemaname='public' ORDER BY tablename", database).splitlines()
+    def validate(self, database, role=None):
+        if role:
+            self.sql('ALTER ROLE ' + identifier(role) + ' LOGIN')
+        try:
+            return self.validate_contents(database, role or DATABASE)
+        finally:
+            if role:
+                self.sql('ALTER ROLE ' + identifier(role) + ' NOLOGIN')
+
+    def validate_contents(self, database, role):
+        def sql(query):
+            return self.sql(query, database, role)
+        tables = sql("SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname='public' ORDER BY tablename").splitlines()
         require({'migrations', 'users', 'businesses', 'documents'}.issubset(tables), 'Required DZDistro tables are missing.')
-        require(self.sql("SELECT count(*) FROM pg_constraint WHERE connamespace='public'::regnamespace AND NOT convalidated", database) == '0', 'Database constraints are not validated.')
-        schema = self.sql("SELECT table_name||':'||column_name||':'||data_type||':'||is_nullable||':'||coalesce(column_default,'') FROM information_schema.columns WHERE table_schema='public' ORDER BY table_name,ordinal_position", database)
-        schema += '\n' + self.sql("SELECT conrelid::regclass::text||':'||contype::text||':'||pg_get_constraintdef(oid) FROM pg_constraint WHERE connamespace='public'::regnamespace ORDER BY conrelid::regclass::text,conname", database)
-        schema += '\n' + self.sql("SELECT migration FROM migrations ORDER BY migration", database)
-        schema += '\n' + self.sql("SELECT indexdef FROM pg_indexes WHERE schemaname='public' ORDER BY tablename,indexname", database)
-        counts = {table: int(self.sql('SELECT count(*) FROM public.' + '"' + table.replace('"', '""') + '"', database)) for table in tables}
+        require(sql("SELECT count(*) FROM pg_catalog.pg_constraint WHERE connamespace='public'::regnamespace AND NOT convalidated") == '0', 'Database constraints are not validated.')
+        schema = sql("SELECT table_name||':'||column_name||':'||data_type||':'||is_nullable||':'||coalesce(column_default,'') FROM information_schema.columns WHERE table_schema='public' ORDER BY table_name,ordinal_position")
+        schema += '\n' + sql("SELECT conrelid::regclass::text||':'||contype::text||':'||pg_get_constraintdef(oid) FROM pg_catalog.pg_constraint WHERE connamespace='public'::regnamespace ORDER BY conrelid::regclass::text,conname")
+        schema += '\n' + sql("SELECT migration FROM public.migrations ORDER BY migration")
+        schema += '\n' + sql("SELECT indexdef FROM pg_catalog.pg_indexes WHERE schemaname='public' ORDER BY tablename,indexname")
+        counts = {table: int(sql('SELECT count(*) FROM public.' + '"' + table.replace('"', '""') + '"')) for table in tables}
         return {'schemaHash': hashlib.sha256(schema.encode()).hexdigest(), 'tables': len(tables), 'rows': sum(counts.values()), 'tableRows': counts}
 
     def restic(self, args, *, output=None):
@@ -220,7 +235,7 @@ class System:
             result = subprocess.run(['docker', 'exec', '-i', self.target_id, 'pg_restore', '--exit-on-error', '--single-transaction', '--no-owner', '--no-acl', '-U', role, '-d', job['candidateDatabase']], stdin=dump, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1200)
         require(result.returncode == 0, 'Isolated PostgreSQL restore failed. Current staging was not replaced.')
         self.sql('ALTER ROLE ' + identifier(role) + ' NOLOGIN')
-        job['validation'] = self.validate(job['candidateDatabase'])
+        job['validation'] = self.validate(job['candidateDatabase'], role)
         current = self.validate(DATABASE)
         require(current['schemaHash'] == job['validation']['schemaHash'], 'Snapshot schema is incompatible with the current staging application.')
         self.sql('ALTER DATABASE ' + identifier(job['candidateDatabase']) + ' ALLOW_CONNECTIONS false')
@@ -285,7 +300,16 @@ class System:
                 time.sleep(1)
 
     def pause(self, container, paused):
-        self.run(['docker', 'pause' if paused else 'unpause', container])
+        if paused:
+            self.run(['docker', 'pause', container])
+            return
+        require(hasattr(self, 'guard_socket'), 'Unpause requires the independent executor.')
+        with socket.socket(socket.AF_UNIX) as connection:
+            connection.settimeout(130)
+            connection.connect(str(self.guard_socket))
+            connection.sendall(json.dumps({'container': container}).encode() + b'\n')
+            response = connection.recv(1024)
+            require(response == b'completed\n', 'Independent executor did not verify unpause completion; inspect recovery status.')
 
     def hold_writers(self, job):
         failures = []
@@ -313,6 +337,7 @@ class System:
             require(select.select([reader], [], [], 15)[0] and os.read(reader, 16) == b'ready\n', 'Independent resume guard did not start.')
             identity = process_identity(process.pid)
             require(identity is not None, 'Independent resume guard exited.')
+            self.guard_socket = Path(self.config['stateDir']) / (job['id'] + '.guard.sock')
             return identity
         finally:
             os.close(reader)
@@ -350,6 +375,23 @@ class Workflow:
         require(JOB_ID.fullmatch(job_id or '') is not None, 'Invalid recovery job.')
         return self.directory / (job_id + '.json')
 
+    @contextmanager
+    def transition(self, job):
+        with self.path(job['id']).with_suffix('.transition.lock').open('a') as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            yield
+
+    def released_path(self, job):
+        require(re.fullmatch(r'[0-9]{10,}-[0-9a-f]{32}', job['lockOwner']) is not None, 'Invalid release identity.')
+        return ROLLOUT_LOCK.with_name(ROLLOUT_LOCK.name + '.released-' + job['lockOwner'])
+
+    def released(self, job):
+        path = self.released_path(job)
+        if not path.exists():
+            return False
+        require(not path.is_symlink() and read_json(path / 'owner.json') == {'schema_version': 1, 'environment': 'staging', 'rollout_id': job['lockOwner']}, 'Release receipt belongs to another operation.')
+        return True
+
     def persist(self, job):
         if job['phase'] in {'preparing', 'freezing', 'switching', 'resuming'}:
             job['process'] = process_identity(os.getpid())
@@ -374,9 +416,15 @@ class Workflow:
         save_json(ROLLOUT_LOCK / 'owner.json', {'schema_version': 1, 'environment': 'staging', 'rollout_id': job['lockOwner']}, 0o640)
 
     def release(self, job):
+        if self.released(job):
+            return
         self.owned_lock(job)
-        (ROLLOUT_LOCK / 'owner.json').unlink()
-        ROLLOUT_LOCK.rmdir()
+        os.rename(ROLLOUT_LOCK, self.released_path(job))
+        descriptor = os.open(ROLLOUT_LOCK.parent, os.O_DIRECTORY)
+        try:
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
 
     def check_target(self, job):
         require(self.system.target()['Id'] == job['containerId'], 'The PostgreSQL container changed; recovery refuses to advance.')
@@ -393,7 +441,8 @@ class Workflow:
             if job and job['phase'] in {'preparing', 'freezing', 'switching', 'resuming'}:
                 identity = job.get('process')
                 if not identity or process_identity(identity['pid']) != identity:
-                    job['phase'] = 'held'
+                    guard = job.get('guard')
+                    job['phase'] = 'containing' if job['phase'] == 'resuming' and guard and process_identity(guard['pid']) == guard else 'held'
                     job['interrupted'] = True
             return job
         job_id = request.get('jobId')
@@ -448,10 +497,11 @@ class Workflow:
             require(job['phase'] == expected_phase and not (action == 'freeze-rollback' and job.get('rolledBack')), 'Job is not eligible for this pause.')
             expected_oid = job['originalOID'] if action == 'freeze' else job['candidateOID']
             require(self.system.oid(DATABASE) == expected_oid, 'Current staging database belongs to another recovery.')
-            require(self.system.validate(DATABASE)['schemaHash'] == job['validation']['schemaHash'], 'Staging schema changed after validation.')
+            require(self.system.validate(DATABASE, job.get('candidateRole') if action == 'freeze-rollback' else None)['schemaHash'] == job['validation']['schemaHash'], 'Staging schema changed after validation.')
             job['writers'] = self.system.writers()
             require([{k: item[k] for k in ['id', 'image', 'configHash']} for item in job['writers']] == [{k: item[k] for k in ['id', 'image', 'configHash']} for item in job['validationWriters']], 'Staging release changed after the test restore; validate again.')
             require(not any(item['paused'] for item in job['writers']), 'Another operator already paused staging.')
+            job['lockOwner'] = str(int(time.time())) + '-' + secrets.token_hex(16)
             self.audit(request, 'intent')
             job['phase'] = 'freezing'
             self.persist(job)
@@ -502,7 +552,7 @@ class Workflow:
             self.owned_lock(job)
             expected_oid = job['originalOID'] if job.get('rolledBack') else job['candidateOID']
             require(self.system.oid(DATABASE) == expected_oid, 'Active database identity changed.')
-            require(self.system.validate(DATABASE)['schemaHash'] == job['validation']['schemaHash'], 'Restored staging schema did not validate.')
+            require(self.system.validate(DATABASE, None if job.get('rolledBack') else job.get('candidateRole'))['schemaHash'] == job['validation']['schemaHash'], 'Restored staging schema did not validate.')
             self.system.verify_writers(job, True)
             self.system.probe_fence(job)
             self.audit(request, 'intent-after-operator-queue-cache-checks')
@@ -512,7 +562,10 @@ class Workflow:
             committed = False
             try:
                 job['guard'] = self.system.start_guard(job)
-                self.persist(job)
+                with self.transition(job):
+                    require(read_json(self.path(job['id']))['phase'] == 'resuming', 'Resume was already contained.')
+                    self.system.check_guard(job)
+                    self.persist(job)
                 web = next(item for item in job['writers'] if item['role'] == 'web')
                 self.system.check_guard(job)
                 self.system.pause(web['id'], False)
@@ -521,19 +574,22 @@ class Workflow:
                     if item['role'] != 'web':
                         self.system.check_guard(job)
                         self.system.pause(item['id'], False)
-                self.system.verify_writers(job, False)
-                self.system.check_guard(job)
-                job['phase'] = 'resume-committed'
-                self.persist(job)
-                committed = True
+                with self.transition(job):
+                    require(read_json(self.path(job['id']))['phase'] == 'resuming', 'Resume was already contained.')
+                    self.system.verify_writers(job, False)
+                    self.system.check_guard(job)
+                    job['phase'] = 'resume-committed'
+                    self.persist(job)
+                    committed = True
                 self.finish_resume(job)
             except Exception:
                 if not committed:
-                    try:
-                        self.system.hold_writers(job)
-                    finally:
-                        job['phase'] = 'held'
-                        self.persist(job)
+                    with self.transition(job):
+                        try:
+                            self.system.hold_writers(job)
+                        finally:
+                            job['phase'] = 'held'
+                            self.persist(job)
                 raise
         elif action == 'abort':
             require(job['phase'] in {'validated', 'failed'}, 'A paused or switched recovery cannot be discarded.')
@@ -555,14 +611,14 @@ class Workflow:
         require(self.system.oid(DATABASE) == expected, 'Committed database identity changed.')
         self.system.verify_writers(job, False)
         self.system.probe_web(job)
-        if ROLLOUT_LOCK.exists():
+        released = self.released(job)
+        if ROLLOUT_LOCK.exists() and not released:
             self.owned_lock(job)
         path = Path(self.config['proxyConfig'])
         if path.exists():
-            require(ROLLOUT_LOCK.exists(), 'Cannot remove a fence without its owned lock.')
+            require(not released and ROLLOUT_LOCK.exists(), 'Cannot remove a fence without its owned lock.')
             self.system.fence(job, False)
-        if ROLLOUT_LOCK.exists():
-            self.release(job)
+        self.release(job)
         job['phase'] = 'resumed'
         self.persist(job)
 
@@ -574,21 +630,61 @@ class Workflow:
         self.owned_lock(job)
         self.system.verify_writers(job, True)
         self.system.probe_fence(job)
-        os.write(ready_fd, b'ready\n')
-        os.close(ready_fd)
-        while True:
-            current = read_json(self.path(job_id))
-            if current['phase'] != 'resuming':
-                return
-            identity = job['process']
-            if process_identity(identity['pid']) != identity or not sessions_alive(job):
-                self.owned_lock(job)
-                self.system.hold_writers(job)
-                current['phase'] = 'held'
-                current['interrupted'] = True
-                self.persist(current)
-                return
-            time.sleep(0.25)
+        path = self.path(job_id).with_suffix('.guard.sock')
+        with socket.socket(socket.AF_UNIX) as server:
+            server.bind(str(path))
+            os.chmod(path, 0o600)
+            server.listen(1)
+            os.write(ready_fd, b'ready\n')
+            os.close(ready_fd)
+            try:
+                while True:
+                    with self.transition(job):
+                        current = read_json(self.path(job_id))
+                        if current['phase'] not in {'resuming', 'held'}:
+                            return
+                        identity = current['process']
+                        if current['phase'] == 'held' or process_identity(identity['pid']) != identity or not sessions_alive(current):
+                            self.owned_lock(current)
+                            self.system.hold_writers(current)
+                            if current['phase'] != 'held':
+                                current['phase'] = 'held'
+                                current['interrupted'] = True
+                                try:
+                                    self.persist(current)
+                                except OSError:
+                                    pass
+                    if not select.select([server], [], [], 0.25)[0]:
+                        continue
+                    with server.accept()[0] as connection:
+                        connection.settimeout(10)
+                        data = bytearray()
+                        while b'\n' not in data and len(data) <= 1024:
+                            chunk = connection.recv(1024)
+                            if not chunk:
+                                break
+                            data.extend(chunk)
+                        request = json.loads(data, object_pairs_hook=no_duplicates)
+                        require(set(request) == {'container'} and request['container'] in {item['id'] for item in job['writers']}, 'Unpause executor rejected an unrecorded identity.')
+                        with self.transition(job):
+                            current = read_json(self.path(job_id))
+                            identity = current['process']
+                            if current['phase'] != 'resuming' or process_identity(identity['pid']) != identity or not sessions_alive(current):
+                                continue
+                            self.owned_lock(current)
+                            try:
+                                self.system.run(['docker', 'unpause', request['container']])
+                                require(process_identity(identity['pid']) == identity and sessions_alive(current), 'Resume owner disappeared during unpause.')
+                                connection.sendall(b'completed\n')
+                            except Exception:
+                                self.system.hold_writers(current)
+                                current['phase'] = 'held'
+                                try:
+                                    self.persist(current)
+                                except OSError:
+                                    pass
+            finally:
+                path.unlink(missing_ok=True)
 
 
 class Fence(http.server.BaseHTTPRequestHandler):

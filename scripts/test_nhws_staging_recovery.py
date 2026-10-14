@@ -29,7 +29,7 @@ class FakeSystem:
     def oid(self, name):
         return self.databases.get(name)
 
-    def validate(self, database):
+    def validate(self, database, role=None):
         return {'schemaHash': 'same-current-release-schema', 'tables': 4, 'rows': self.rows[self.databases[database]], 'tableRows': {}}
 
     def prepare(self, job, dump, persist):
@@ -283,6 +283,30 @@ class RecoveryTests(unittest.TestCase):
                     self.resume()
                 self.assertEqual(self.call('status')['phase'], 'resume-committed')
                 self.assertFalse(any(self.system.states.values()))
+
+    def test_partial_release_keeps_owned_receipt_and_retry_never_unpauses(self):
+        self.prepare()
+        self.freeze()
+        self.restore()
+        release = self.flow.release
+        def fail_after_move(job):
+            release(job)
+            raise OSError('Failure after atomic lock move')
+        self.flow.release = fail_after_move
+        with self.assertRaises(OSError):
+            self.resume()
+        committed = self.call('status')
+        self.assertEqual(committed['phase'], 'resume-committed')
+        self.assertFalse(recovery.ROLLOUT_LOCK.exists())
+        self.assertTrue(self.flow.released(committed))
+        before = [event for event in self.system.events if event.startswith('unpause-') or event == 'switch']
+        recovery.ROLLOUT_LOCK.mkdir()
+        foreign = {'schema_version': 1, 'environment': 'staging', 'rollout_id': 'another-deployment'}
+        recovery.save_json(recovery.ROLLOUT_LOCK / 'owner.json', foreign)
+        self.flow.release = release
+        self.assertEqual(self.resume()['phase'], 'resumed')
+        self.assertEqual(recovery.read_json(recovery.ROLLOUT_LOCK / 'owner.json'), foreign)
+        self.assertEqual([event for event in self.system.events if event.startswith('unpause-') or event == 'switch'], before)
 
     def test_unknown_and_production_requests_have_no_effects(self):
         for extra in [{'environment': 'production'}, {'command': 'shell'}, {'action': 'run-command'}, {'jobId': '../other'}, {'actor': []}]:

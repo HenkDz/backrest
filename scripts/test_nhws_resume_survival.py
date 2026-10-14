@@ -7,6 +7,7 @@ import secrets
 import shutil
 import signal
 import subprocess
+import sys
 import time
 
 worker = Path('/usr/local/libexec/nhweb-backups/staging_recovery.py')
@@ -40,18 +41,22 @@ marker = Path('/run/nhws-recovery-fixture-marker.json')
 shim.write_text('''#!/usr/bin/python3
 import json,sys,subprocess,time,os
 from pathlib import Path
-code=subprocess.run([REAL_DOCKER,*sys.argv[1:]]).returncode
 p=Path('/run/nhws-recovery-fixture-barrier.json')
-if code==0 and p.exists() and len(sys.argv)==3 and sys.argv[1]=='unpause':
- c=json.loads(p.read_text())
- if sys.argv[2]==c['container']:
+def block(c):
   Path('/run/nhws-recovery-fixture-marker.json').write_text(json.dumps({'pid':os.getpid()}))
   deadline=time.monotonic()+60
   while time.monotonic()<deadline:
    if json.loads(p.read_text()).get('release'):
-    sys.stderr.write('Injected synthetic post-unpause failure')
-    sys.exit(1)
+    return
    time.sleep(.05)
+c=json.loads(p.read_text()) if p.exists() else {}
+matched=len(sys.argv)==3 and sys.argv[1]=='unpause' and sys.argv[2]==c.get('container')
+if matched and c['when']=='before': block(c)
+code=subprocess.run([REAL_DOCKER,*sys.argv[1:]]).returncode
+if matched and c['when']=='after': block(c)
+if matched and json.loads(p.read_text()).get('fail'):
+ sys.stderr.write('Injected synthetic unpause failure')
+ sys.exit(1)
 sys.exit(code)
 '''.replace('REAL_DOCKER', repr(real_docker)))
 shim.chmod(0o755)
@@ -71,14 +76,18 @@ def wait_for(predicate, seconds=20):
         time.sleep(.1)
 
 try:
-    cases = [(mode, role) for mode in ['hard-kill', 'SSH-disconnect'] for role in ['web', 'queue', 'scheduler', 'pulse', 'release']]
-    cases.append(('journal-write-failure', 'queue'))
-    for mode, role in cases:
+    cases = [(mode, role, when) for mode in ['hard-kill', 'SSH-disconnect'] for role in ['web', 'queue', 'scheduler', 'pulse', 'release'] for when in ['before', 'after']]
+    cases.append(('journal-write-failure', 'queue', 'after'))
+    for mode, role, when in cases:
         job = recovery.read_json(flow.path(job_id))
-        job['phase'] = 'restored'
-        recovery.save_json(flow.path(job_id), job)
+        previous_guard = job.get('guard')
+        with flow.transition(job):
+            job['phase'] = 'restored'
+            recovery.save_json(flow.path(job_id), job)
+        if previous_guard:
+            wait_for(lambda: recovery.process_identity(previous_guard['pid']) != previous_guard)
         system.verify_writers(job, True)
-        barrier.write_text(json.dumps({'container': next(item['id'] for item in job['writers'] if item['role'] == role)}))
+        barrier.write_text(json.dumps({'container': next(item['id'] for item in job['writers'] if item['role'] == role), 'when': when}))
         if marker.exists():
             marker.unlink()
         client = subprocess.Popen(['ssh', '-i', str(key), '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'UserKnownHostsFile=' + str(known_hosts), 'root@localhost', 'nhws-staging-recovery'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -97,9 +106,10 @@ try:
             client.kill()
         else:
             failed_journal.symlink_to('/dev/full')
-            settings = json.loads(barrier.read_text())
-            settings['release'] = True
-            barrier.write_text(json.dumps(settings))
+        settings = json.loads(barrier.read_text())
+        settings['release'] = True
+        settings['fail'] = mode == 'journal-write-failure'
+        barrier.write_text(json.dumps(settings))
         wait_for(lambda: all(item['paused'] for item in system.writers()))
         assert flow.owned_lock(job) is None and Path(config['proxyConfig']).exists()
         assert system.oid(recovery.DATABASE) == active_oid
@@ -112,23 +122,81 @@ try:
         if failed_journal.is_symlink():
             assert os.readlink(failed_journal) == '/dev/full'
             failed_journal.unlink()
-        assert call('status')['phase'] == 'held'
-        receipts.append({'mode': mode, 'afterUnpause': role, 'allFiveRolesPaused': True, 'activeOIDUnchanged': True, 'fenceAndLockRetained': True})
+        wait_for(lambda: call('status')['phase'] == 'held')
+        receipts.append({'mode': mode, 'role': role, 'barrier': when, 'allFiveRolesPaused': True, 'activeOIDUnchanged': True, 'fenceAndLockRetained': True})
         print(json.dumps(receipts[-1]), flush=True)
         if client.poll() is None:
             client.kill()
         client.wait(timeout=10)
     job = recovery.read_json(flow.path(job_id))
-    job['phase'] = 'restored'
-    recovery.save_json(flow.path(job_id), job)
+    previous_guard = job['guard']
+    with flow.transition(job):
+        job['phase'] = 'restored'
+        recovery.save_json(flow.path(job_id), job)
+    wait_for(lambda: recovery.process_identity(previous_guard['pid']) != previous_guard)
     barrier.unlink()
     marker.unlink(missing_ok=True)
-    call('resume', 'RESUME DZDISTRO STAGING ' + job_id[:8], queuesReconciled=True)
+    child_code = '''import importlib.util,json,subprocess,sys,time
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('r','/usr/local/libexec/nhweb-backups/staging_recovery.py')
+r=importlib.util.module_from_spec(spec);spec.loader.exec_module(r)
+c=r.load_config(r.CONFIG_PATH);s=r.System(c);w=r.Workflow(c,s)
+sentinel=subprocess.Popen([sys.executable,'-c','import time;time.sleep(60)'])
+identity=r.process_identity(sentinel.pid)
+r.ssh_sessions=lambda:[identity]
+original=s.check_guard
+counter=[0]
+mode=sys.argv[2]
+def check(job):
+ counter[0]+=1
+ if counter[0]!=7: return original(job)
+ if mode=='commit-wins': original(job)
+ Path('/run/nhws-recovery-fixture-commit.json').write_text(json.dumps({'sessionPID':sentinel.pid}))
+ deadline=time.monotonic()+30
+ while not Path('/run/nhws-recovery-fixture-commit-release').exists():
+  assert time.monotonic()<deadline
+  time.sleep(.05)
+ if mode=='containment-wins': original(job)
+s.check_guard=check
+try:
+ w.handle({'action':'resume','jobId':sys.argv[1],'actor':'synthetic-interleaving','environment':'staging','confirmation':'RESUME DZDISTRO STAGING '+sys.argv[1][:8],'queuesReconciled':True})
+finally:
+ sentinel.terminate();sentinel.wait()
+'''
+    commit_marker = Path('/run/nhws-recovery-fixture-commit.json')
+    commit_release = Path('/run/nhws-recovery-fixture-commit-release')
+    for mode in ['containment-wins', 'commit-wins']:
+        if mode == 'commit-wins':
+            job = recovery.read_json(flow.path(job_id))
+            previous_guard = job['guard']
+            with flow.transition(job):
+                job['phase'] = 'restored'
+                recovery.save_json(flow.path(job_id), job)
+            wait_for(lambda: recovery.process_identity(previous_guard['pid']) != previous_guard)
+        commit_marker.unlink(missing_ok=True)
+        commit_release.unlink(missing_ok=True)
+        process = subprocess.Popen([sys.executable, '-c', child_code, job_id, mode], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        wait_for(commit_marker.exists, 30)
+        os.kill(json.loads(commit_marker.read_text())['sessionPID'], signal.SIGKILL)
+        commit_release.touch()
+        process.wait(timeout=30)
+        current = call('status')
+        if mode == 'containment-wins':
+            wait_for(lambda: call('status')['phase'] == 'held')
+            assert all(item['paused'] for item in system.writers()) and recovery.ROLLOUT_LOCK.exists() and Path(config['proxyConfig']).exists()
+        else:
+            assert process.returncode == 0 and current['phase'] == 'resumed'
+            wait_for(lambda: recovery.process_identity(current['guard']['pid']) != current['guard'])
+            assert not any(item['paused'] for item in system.writers()) and not recovery.ROLLOUT_LOCK.exists() and not Path(config['proxyConfig']).exists()
+        receipts.append({'interleaving': mode, 'terminalStateAndProtectionsCoherent': True})
+        print(json.dumps(receipts[-1]), flush=True)
+    commit_marker.unlink(missing_ok=True)
+    commit_release.unlink(missing_ok=True)
     call('freeze-rollback', 'PAUSE DZDISTRO STAGING')
     call('rollback', 'ROLLBACK DZDISTRO STAGING ' + job_id[:8])
     call('resume', 'RESUME DZDISTRO STAGING ' + job_id[:8], queuesReconciled=True)
-    assert system.sql('SELECT count(*) FROM documents', recovery.DATABASE) == '2'
-    assert system.sql('SELECT sum(amount) FROM documents', recovery.DATABASE) == '300.00'
+    assert system.sql('SELECT count(*) FROM public.documents', recovery.DATABASE) == '2'
+    assert system.sql('SELECT sum(amount) FROM public.documents', recovery.DATABASE) == '300.00'
     print(json.dumps({'resume_survival': 'PASS', 'cases': len(receipts), 'scope': 'labelled synthetic Linux fixture; real SSH disconnect and SIGKILL; no live staging access'}))
 finally:
     for client in clients:
