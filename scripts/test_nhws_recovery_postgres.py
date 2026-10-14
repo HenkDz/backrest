@@ -71,16 +71,27 @@ with tempfile.TemporaryDirectory(prefix='nhws-pg-rehearsal-') as temporary:
     system.paused, system.fenced = False, False
     system.sql('''CREATE TABLE public.migrations(id serial PRIMARY KEY, migration text NOT NULL, batch int NOT NULL);
 CREATE TABLE public.users(id serial PRIMARY KEY, name text NOT NULL);
-CREATE TABLE public.businesses(id serial PRIMARY KEY, user_id int NOT NULL REFERENCES public.users(id));
-CREATE TABLE public.documents(id serial PRIMARY KEY, business_id int NOT NULL REFERENCES public.businesses(id), amount numeric(12,2) NOT NULL CHECK(amount>=0));
+CREATE TABLE public.tenants(id serial PRIMARY KEY, user_id int NOT NULL REFERENCES public.users(id));
+CREATE TABLE public.documents(id serial PRIMARY KEY, tenant_id int NOT NULL REFERENCES public.tenants(id), amount numeric(12,2) NOT NULL CHECK(amount>=0));
 INSERT INTO public.migrations(migration,batch) VALUES('synthetic_initial_schema',1);
 INSERT INTO public.users(name) VALUES('Synthetic operator');
-INSERT INTO public.businesses(user_id) VALUES(1);
-INSERT INTO public.documents(business_id,amount) VALUES(1,100.00);''', recovery.DATABASE)
+INSERT INTO public.tenants(user_id) VALUES(1);
+INSERT INTO public.documents(tenant_id,amount) VALUES(1,100.00);''', recovery.DATABASE)
+    original_oid = system.oid(recovery.DATABASE)
+    assert system.validate(recovery.DATABASE)['tables'] == 4
+    system.sql('ALTER TABLE public.tenants RENAME TO businesses', recovery.DATABASE)
+    try:
+        system.validate(recovery.DATABASE)
+        raise AssertionError('Legacy businesses-only fixture was accepted as DZDistro')
+    except recovery.Refusal as error:
+        assert str(error) == 'Required DZDistro tables are missing: tenants.'
+    assert system.oid(recovery.DATABASE) == original_oid
+    assert system.sql('SELECT count(*) FROM public.documents', recovery.DATABASE) == '1'
+    system.sql('ALTER TABLE public.businesses RENAME TO tenants', recovery.DATABASE)
     dump = subprocess.check_output(['docker', 'exec', system.target_id, 'pg_dump', '-U', recovery.DATABASE, '-d', recovery.DATABASE, '-Fc', '--no-owner', '--no-acl'])
     subprocess.run(command + ['backup', '--stdin', '--stdin-filename', 'dzdistro_staging.dump', '--tag', 'staging-postgres'], input=dump, env=env, check=True, stdout=subprocess.DEVNULL)
     snapshot = json.loads(subprocess.check_output(command + ['snapshots', '--json'], env=env))[0]['id']
-    system.sql('INSERT INTO public.documents(business_id,amount) VALUES(1,200.00)', recovery.DATABASE)
+    system.sql('INSERT INTO public.documents(tenant_id,amount) VALUES(1,200.00)', recovery.DATABASE)
     assert system.sql('SELECT count(*) FROM public.documents', recovery.DATABASE) == '2'
     recovery.ROLLOUT_LOCK = root / 'shared-staging-rollout.lock'
     flow = recovery.Workflow(config, system)
@@ -191,7 +202,7 @@ CREATE TRIGGER archive_write_callback BEFORE INSERT ON public.documents FOR EACH
         pass
     assert call('status')['phase'] == 'failed'
     assert system.oid(recovery.DATABASE) == active_oid
-    system.sql('INSERT INTO public.documents(business_id,amount) VALUES(1,50.00)', recovery.DATABASE)
+    system.sql('INSERT INTO public.documents(tenant_id,amount) VALUES(1,50.00)', recovery.DATABASE)
     assert system.sql('SELECT count(*) FROM public.documents', recovery.DATABASE) == '3'
     assert system.sql('SELECT sum(amount) FROM public.documents', recovery.DATABASE) == '350.00'
     assert system.oid(job['afterDatabase']) == job['candidateOID']

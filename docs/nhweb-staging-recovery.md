@@ -61,6 +61,10 @@ A known competing deployment lock refuses before fencing or pausing and leaves t
 
 ## Verification
 
+The backup picker shows dated rows, newest first, with Algiers time and an explicit selection. A failed validation keeps that selection and records its safe failure reason for subsequent status refreshes. A rejected test refreshes status without retrying the mutation.
+
+The required core tables are `public.migrations`, `public.users`, `public.tenants` and `public.documents`, matching DZDistro's tenant model. The PostgreSQL rehearsal uses `tenants` and document `tenant_id` references; it additionally refuses a businesses-only schema while preserving the active OID and rows. Full schema, migration, constraint and executable-object comparisons remain required before cutover.
+
 Frontend uses the upstream locked dependencies; no application dependency was added. With pnpm12, allow only the two existing build dependencies when installing: `pnpm install --frozen-lockfile --allow-build=esbuild --allow-build=@parcel/watcher`. Node24 is used for the upstream jsdom test harness; Node26's native Web Storage currently conflicts with that harness. No global Node version switch is needed.
 
 Focused checks:

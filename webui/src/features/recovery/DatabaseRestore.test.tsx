@@ -44,18 +44,81 @@ describe("guided staging recovery", () => {
       }),
     });
     render(<DatabaseRestore />);
-    await screen.findByRole("option", { name: /aaaaaaaa/ });
+    await screen.findByRole("radio", { name: /aaaaaaaa/ });
     expect(screen.getByRole("button", { name: /Test restore/ })).toBeDisabled();
-    fireEvent.change(
-      screen.getByRole("combobox", { name: "Recovery snapshot" }),
-      { target: { value: snapshotId } },
-    );
+    fireEvent.click(screen.getByRole("radio", { name: /aaaaaaaa/ }));
     fireEvent.click(screen.getByRole("button", { name: /Test restore/ }));
     await waitFor(() => expect(fetchRecovery).toHaveBeenCalledTimes(2));
     expect(JSON.parse(fetchRecovery.mock.calls[1][1].body)).toEqual({
       action: "prepare",
       snapshotId,
     });
+  });
+
+  it("shows newest backups first and retains a failed selection after reload", async () => {
+    fetchRecovery.mockClear();
+    const older = "c".repeat(64);
+    fetchRecovery.mockResolvedValue({
+      ok: true,
+      json: async () => ({
+        environment: "staging",
+        snapshots: [
+          { id: older, time: "2026-10-13T01:00:00Z" },
+          { id: snapshotId, time: "2026-10-14T01:00:00Z" },
+        ],
+        job: {
+          ...baseJob,
+          phase: "failed",
+          failureReason: "Schema did not match.",
+        },
+      }),
+    });
+    render(<DatabaseRestore />);
+    const radios = await screen.findAllByRole("radio");
+    expect(radios[0]).toHaveAccessibleName(/aaaaaaaa/);
+    expect(radios[0]).toBeChecked();
+    expect(screen.getByRole("alert")).toHaveTextContent(
+      "Schema did not match.",
+    );
+    expect(screen.getByRole("button", { name: /Test restore/ })).toBeEnabled();
+    expect(screen.queryByRole("combobox")).not.toBeInTheDocument();
+  });
+
+  it("refreshes failed test status without retrying the mutation", async () => {
+    fetchRecovery.mockClear();
+    const state = {
+      environment: "staging",
+      snapshots: [{ id: snapshotId, time: "2026-10-14T01:00:00Z" }],
+      job: null,
+    };
+    fetchRecovery
+      .mockResolvedValueOnce({ ok: true, json: async () => state })
+      .mockResolvedValueOnce({
+        ok: false,
+        json: async () => ({ error: "Schema did not match." }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        json: async () => ({
+          ...state,
+          job: {
+            ...baseJob,
+            phase: "failed",
+            failureReason: "Schema did not match.",
+          },
+        }),
+      });
+    render(<DatabaseRestore />);
+    fireEvent.click(await screen.findByRole("radio", { name: /aaaaaaaa/ }));
+    fireEvent.click(screen.getByRole("button", { name: /Test restore/ }));
+    await screen.findByRole("heading", { name: "Recovery status: failed" });
+    expect(screen.getByRole("radio", { name: /aaaaaaaa/ })).toBeChecked();
+    expect(screen.getAllByRole("alert")).toHaveLength(1);
+    expect(fetchRecovery).toHaveBeenCalledTimes(3);
+    expect(fetchRecovery.mock.calls[2][1]).toBeUndefined();
+    expect(
+      fetchRecovery.mock.calls.filter((call) => call[1]?.method === "POST"),
+    ).toHaveLength(1);
   });
 
   it("will not switch with an empty or wrong confirmation", async () => {

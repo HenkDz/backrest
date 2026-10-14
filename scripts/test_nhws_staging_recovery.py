@@ -115,6 +115,27 @@ class RecoveryTests(unittest.TestCase):
         request.update(extra)
         return self.flow.handle(request)
 
+    def test_validation_failure_remains_visible_without_touching_active_data(self):
+        def fail(job, dump, persist):
+            raise recovery.Refusal('Required DZDistro tables are missing: tenants.')
+        self.system.prepare = fail
+        with self.assertRaises(recovery.Refusal):
+            self.call('prepare', snapshotId=SNAPSHOT)
+        job = self.call('status')
+        self.assertEqual(job['phase'], 'failed')
+        self.assertEqual(job['failureReason'], 'Required DZDistro tables are missing: tenants.')
+        self.assertEqual(self.system.oid(recovery.DATABASE), 10)
+        self.assertFalse(self.system.paused)
+        self.assertFalse(self.system.fenced)
+
+    def test_unexpected_validation_error_is_not_exposed_in_status(self):
+        def fail(job, dump, persist):
+            raise RuntimeError('private credential must not appear')
+        self.system.prepare = fail
+        with self.assertRaises(RuntimeError):
+            self.call('prepare', snapshotId=SNAPSHOT)
+        self.assertNotIn('private credential', self.call('status')['failureReason'])
+
     def prepare(self):
         return self.call('prepare', snapshotId=SNAPSHOT)
 

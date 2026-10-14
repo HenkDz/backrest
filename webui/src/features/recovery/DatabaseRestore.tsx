@@ -5,7 +5,6 @@ import {
   Flex,
   Heading,
   Input,
-  NativeSelect,
   Spinner,
   Text,
 } from "@chakra-ui/react";
@@ -21,6 +20,7 @@ export type RecoveryJob = {
   rolledBack?: boolean;
   dumpSha256?: string;
   dumpBytes?: number;
+  failureReason?: string;
   validation?: { tables: number; rows: number; schemaHash: string };
 };
 type RecoveryState = {
@@ -116,6 +116,17 @@ export const DatabaseRestore = () => {
   const [error, setError] = useState("");
   const job = state?.job;
   const next = recoveryAction(job);
+  const updateState = (result: RecoveryState) => {
+    setState(result);
+    setSnapshotId((current) => {
+      const active =
+        result.job &&
+        !["failed", "aborted", "resumed"].includes(result.job.phase);
+      return active
+        ? result.job!.snapshotId
+        : current || result.job?.snapshotId || "";
+    });
+  };
 
   const request = async (action?: string, phrase?: string) => {
     setBusy(true);
@@ -145,12 +156,23 @@ export const DatabaseRestore = () => {
       } catch {
         throw new Error("Sign in again or refresh the recovery status.");
       }
-      if (!response.ok)
+      if (!response.ok) {
+        if (action === "prepare") {
+          try {
+            const status = await authenticatedFetch(
+              `${backendUrl.replace(/\/$/, "")}/api/database-restore`,
+            );
+            if (status.ok) updateState(await status.json());
+          } catch {
+            // Preserve the test failure if its status cannot be refreshed.
+          }
+        }
         throw new Error(
           result.error ||
             "Recovery could not advance. Refresh its status before retrying.",
         );
-      setState(result);
+      }
+      updateState(result);
       setConfirmation("");
       setReconciled(false);
     } catch (e) {
@@ -164,7 +186,14 @@ export const DatabaseRestore = () => {
     void request();
   }, []);
   const openJob = job && !["failed", "aborted", "resumed"].includes(job.phase);
-  const canPrepare = !busy && !!snapshotId && !openJob;
+  const selectionDisabled = busy || !!openJob || !state;
+  const snapshots = [...(state?.snapshots || [])].sort(
+    (a, b) => new Date(b.time).getTime() - new Date(a.time).getTime(),
+  );
+  const canPrepare =
+    !busy &&
+    !openJob &&
+    snapshots.some((snapshot) => snapshot.id === snapshotId);
   const canAdvance =
     !busy &&
     !!next &&
@@ -199,33 +228,93 @@ export const DatabaseRestore = () => {
           Backups remain encrypted with restic. Testing creates an isolated
           database; it does not overwrite staging.
         </Text>
-        <label htmlFor="recovery-snapshot">Recovery snapshot</label>
-        <NativeSelect.Root mt={2} mb={4} disabled={busy || !!openJob || !state}>
-          <NativeSelect.Field
-            id="recovery-snapshot"
-            value={snapshotId}
-            onChange={(event: React.ChangeEvent<HTMLSelectElement>) =>
-              setSnapshotId(event.target.value)
-            }
-            display="block"
-            width="full"
-            bg="bg.panel"
-            borderWidth="1px"
-            borderRadius="md"
-            p={3}
-            mt={2}
-            mb={4}
-          >
-            <option value="">Choose a snapshot from before the problem</option>
-            {state?.snapshots.map((snapshot) => (
-              <option key={snapshot.id} value={snapshot.id}>
-                {new Date(snapshot.time).toLocaleString()} ·{" "}
-                {snapshot.id.slice(0, 8)}
-              </option>
-            ))}
-          </NativeSelect.Field>
-          <NativeSelect.Indicator />
-        </NativeSelect.Root>
+        <fieldset
+          disabled={!!selectionDisabled}
+          style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}
+        >
+          <legend>Available backups</legend>
+          <Text color="fg.muted" fontSize="sm" mt={1} mb={3}>
+            Newest first · times shown in Algiers (UTC+1)
+          </Text>
+          <Box maxH="380px" overflowY="auto" mb={4}>
+            {snapshots.map((snapshot, index) => {
+              const date = new Date(snapshot.time);
+              const day = date.toLocaleDateString(undefined, {
+                day: "numeric",
+                month: "long",
+                year: "numeric",
+                timeZone: "Africa/Algiers",
+              });
+              const time = date.toLocaleTimeString(undefined, {
+                hour: "2-digit",
+                minute: "2-digit",
+                hour12: false,
+                timeZone: "Africa/Algiers",
+              });
+              const selected = snapshotId === snapshot.id;
+              return (
+                <Flex
+                  as="label"
+                  key={snapshot.id}
+                  align="center"
+                  gap={4}
+                  p={4}
+                  mb={2}
+                  borderWidth="1px"
+                  borderColor={selected ? "blue.500" : "border"}
+                  bg={selected ? "bg.subtle" : "bg.panel"}
+                  borderRadius="md"
+                  cursor={selectionDisabled ? "not-allowed" : "pointer"}
+                  opacity={selectionDisabled ? 0.6 : 1}
+                  css={{
+                    "&:focus-within": {
+                      outline: "2px solid",
+                      outlineColor: "blue.500",
+                      outlineOffset: "-2px",
+                    },
+                  }}
+                >
+                  <input
+                    type="radio"
+                    name="recovery-snapshot"
+                    value={snapshot.id}
+                    checked={selected}
+                    aria-label={`Backup ${day} at ${time} Algiers, snapshot ${snapshot.id.slice(0, 8)}`}
+                    onChange={() => {
+                      setSnapshotId(snapshot.id);
+                      setError("");
+                    }}
+                  />
+                  <Box flex="1" minW={0}>
+                    <Flex gap={2} align="center" wrap="wrap">
+                      <Text fontWeight="semibold">{day}</Text>
+                      {index === 0 && (
+                        <Text color="blue.fg" fontSize="xs" fontWeight="bold">
+                          Latest backup
+                        </Text>
+                      )}
+                    </Flex>
+                    <Text color="fg.muted" fontSize="sm" mt={1}>
+                      {time} · Snapshot {snapshot.id.slice(0, 8)}
+                    </Text>
+                  </Box>
+                  {selected && (
+                    <Text fontSize="sm" fontWeight="bold">
+                      Selected
+                    </Text>
+                  )}
+                </Flex>
+              );
+            })}
+            {snapshots.length === 0 && (
+              <Text color="fg.muted" py={3}>
+                {state
+                  ? "No recovery backups are available."
+                  : "Loading backups…"}
+              </Text>
+            )}
+          </Box>
+        </fieldset>
         <Button disabled={!canPrepare} onClick={() => void request("prepare")}>
           Test restore into isolated database
         </Button>
@@ -247,6 +336,18 @@ export const DatabaseRestore = () => {
               : descriptions[job.phase] ||
                 "Check the worker status before advancing."}
           </Text>
+          {job.phase === "failed" && job.failureReason && (
+            <Box
+              role="alert"
+              borderWidth="1px"
+              borderColor="red.500"
+              borderRadius="md"
+              p={3}
+              mt={3}
+            >
+              {job.failureReason}
+            </Box>
+          )}
           <Text color="fg.muted" mt={3}>
             Snapshot {job.snapshotId.slice(0, 8)}
             {job.snapshotTime &&
@@ -371,7 +472,7 @@ export const DatabaseRestore = () => {
           </>
         )}
       </Flex>
-      {error && (
+      {error && error !== job?.failureReason && (
         <Box
           role="alert"
           borderWidth="1px"

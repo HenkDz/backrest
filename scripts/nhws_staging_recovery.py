@@ -181,7 +181,8 @@ class System:
         def sql(query):
             return self.sql(query, database, role)
         tables = sql("SELECT tablename FROM pg_catalog.pg_tables WHERE schemaname='public' ORDER BY tablename").splitlines()
-        require({'migrations', 'users', 'businesses', 'documents'}.issubset(tables), 'Required DZDistro tables are missing.')
+        missing = {'migrations', 'users', 'tenants', 'documents'} - set(tables)
+        require(not missing, 'Required DZDistro tables are missing: ' + ', '.join(sorted(missing)) + '.')
         require(sql("SELECT count(*) FROM pg_catalog.pg_constraint WHERE connamespace='public'::regnamespace AND NOT convalidated") == '0', 'Database constraints are not validated.')
         schema = sql("SELECT table_name||':'||column_name||':'||data_type||':'||is_nullable||':'||coalesce(column_default,'') FROM information_schema.columns WHERE table_schema='public' ORDER BY table_name,ordinal_position")
         schema += '\n' + sql("SELECT conrelid::regclass::text||':'||contype::text||':'||pg_get_constraintdef(oid) FROM pg_catalog.pg_constraint WHERE connamespace='public'::regnamespace ORDER BY conrelid::regclass::text,conname")
@@ -483,8 +484,9 @@ class Workflow:
                 self.persist(job)
                 self.audit(request, 'validated')
                 return job
-            except Exception:
+            except Exception as error:
                 job['phase'] = 'failed'
+                job['failureReason'] = str(error) if isinstance(error, Refusal) else 'The isolated restore could not be validated. Inspect the restricted worker logs.'
                 if job.get('candidateOID') and self.system.oid(job['candidateDatabase']) == job['candidateOID']:
                     self.system.sql('DROP DATABASE ' + identifier(job['candidateDatabase']) + ' WITH (FORCE)')
                     job['candidateOID'] = None
