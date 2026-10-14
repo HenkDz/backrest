@@ -105,6 +105,7 @@ describe("guided staging recovery", () => {
             ...baseJob,
             phase: "failed",
             failureReason: "Schema did not match.",
+            validation: { tables: 123, rows: 71645, schemaHash: "mismatched" },
           },
         }),
       });
@@ -114,6 +115,10 @@ describe("guided staging recovery", () => {
     await screen.findByRole("heading", { name: "Recovery status: failed" });
     expect(screen.getByRole("radio", { name: /aaaaaaaa/ })).toBeChecked();
     expect(screen.getAllByRole("alert")).toHaveLength(1);
+    expect(screen.getByText(/123 tables.*rows inspected/)).toBeInTheDocument();
+    expect(
+      screen.queryByText(/schema compatibility passed/),
+    ).not.toBeInTheDocument();
     expect(fetchRecovery).toHaveBeenCalledTimes(3);
     expect(fetchRecovery.mock.calls[2][1]).toBeUndefined();
     expect(

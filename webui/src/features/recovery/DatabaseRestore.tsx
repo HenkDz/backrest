@@ -356,8 +356,7 @@ export const DatabaseRestore = () => {
           {job.validation && (
             <Text mt={3}>
               {job.validation.tables} tables ·{" "}
-              {job.validation.rows.toLocaleString()} rows · schema compatibility
-              passed
+              {job.validation.rows.toLocaleString()} rows inspected
             </Text>
           )}
           {job.dumpSha256 && (
