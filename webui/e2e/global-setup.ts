@@ -32,9 +32,11 @@ export default async function globalSetup() {
  */
 async function buildWebuiDist(): Promise<void> {
   const distIndex = path.join(WEBUI_DIR, 'dist', 'index.html');
+  // Larger branded pages cross the gzip threshold and lose the original file.
+  const hasDist = (await exists(distIndex)) || (await exists(distIndex + '.gz'));
 
   if (process.env.E2E_SKIP_WEBUI_BUILD === '1') {
-    if (!(await exists(distIndex))) {
+    if (!hasDist) {
       throw new Error(
         'E2E_SKIP_WEBUI_BUILD=1 but webui/dist does not exist; run `pnpm run build` once first',
       );
@@ -45,7 +47,7 @@ async function buildWebuiDist(): Promise<void> {
 
   const newestMtimeMs = await newestSourceMtime();
   const marker = await readJson<{ newestMtimeMs: number }>(DIST_MARKER);
-  if (marker?.newestMtimeMs === newestMtimeMs && (await exists(distIndex))) {
+  if (marker?.newestMtimeMs === newestMtimeMs && hasDist) {
     console.log('[e2e setup] webui dist is fresh, skipping build');
     return;
   }

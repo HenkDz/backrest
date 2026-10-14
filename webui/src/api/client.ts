@@ -25,6 +25,8 @@ const fetch = (
   return window.fetch(input, init);
 };
 
+export const authenticatedFetch = fetch;
+
 const transport = createConnectTransport({
   baseUrl: backendUrl,
   useBinaryFormat: true,

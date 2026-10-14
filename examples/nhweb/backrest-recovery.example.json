@@ -1,0 +1,9 @@
+{
+  "schemaVersion": 1,
+  "environment": "staging",
+  "repoId": "dzdistro-staging-postgres",
+  "repoGuid": "REPLACE_WITH_CONFIGURED_BACKREST_REPOSITORY_GUID",
+  "sshConfig": "/config/staging-recovery-ssh-config",
+  "sshAlias": "dzdistro-staging-recovery",
+  "operators": ["admin"]
+}

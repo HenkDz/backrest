@@ -1,0 +1,19 @@
+[Unit]
+Description=NHWeb staging database recovery maintenance responder
+After=network.target
+
+[Service]
+User=nobody
+Group=nogroup
+ExecStart=/usr/bin/python3 /usr/local/libexec/nhweb-backups/staging_recovery.py --serve-fence
+Restart=on-failure
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+MemoryMax=64M
+CPUQuota=20%
+TasksMax=32
+
+[Install]
+WantedBy=multi-user.target

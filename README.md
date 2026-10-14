@@ -1,3 +1,9 @@
+> **NHWeb Services Backups fork:** branded administration and a guided,
+> staging-only DZDistro database restore workflow. Restic remains the encryption
+> engine. See [the workflow and deployment contract](docs/nhweb-staging-recovery.md).
+> Modified versions remain under the upstream GPLv3 license; Backrest attribution
+> and upstream source history are retained.
+
 <p align="center">
   <picture>
     <source media="(prefers-color-scheme: dark)" srcset="./webui/assets/logo.svg" width="400px">

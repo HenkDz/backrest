@@ -58,7 +58,6 @@ import { uiBuildVersion } from "../state/buildcfg";
 import { ActivityBar } from "../components/layout/ActivityBar";
 import { OperationStatus } from "../../gen/ts/v1/operations_pb";
 import { useResourceStatus } from "../api/resourceStatus";
-import LogoSvg from "../../assets/logo.svg";
 import { keyBy } from "../lib/util";
 import { Code } from "@connectrpc/connect";
 import { LoginModal } from "../features/auth/LoginModal";
@@ -102,6 +101,12 @@ const SummaryDashboard = React.lazy(() =>
 const GettingStartedGuide = React.lazy(() =>
   import("../features/dashboard/GettingStartedGuide").then((m) => ({
     default: m.GettingStartedGuide,
+  })),
+);
+
+const DatabaseRestore = React.lazy(() =>
+  import("../features/recovery/DatabaseRestore").then((m) => ({
+    default: m.DatabaseRestore,
   })),
 );
 
@@ -650,6 +655,17 @@ const SidebarContent = ({ onClose }: { onClose?: () => void }) => {
           </Flex>
         </Box>
 
+        <Button
+          variant="ghost"
+          width="full"
+          justifyContent="flex-start"
+          borderRadius="0"
+          bg={isActive("/database-restore") ? "bg.muted" : undefined}
+          onClick={() => handleNav("/database-restore")}
+        >
+          <FiDatabase /> Database recovery
+        </Button>
+
         {/* PLANS SECTION */}
         <AccordionItem value="plans">
           <AccordionItemTrigger px={4} py={2} _hover={{ bg: "bg.muted" }}>
@@ -902,19 +918,28 @@ export const App: React.FC = () => {
         <Box display={{ base: "block", lg: "none" }} mr={2}>
           <MobileNavTrigger />
         </Box>
-        <Box as="a" cursor="pointer" onClick={() => navigate("/")} mr={4}>
-          <img src={LogoSvg} style={{ height: "30px", marginBottom: "-4px" }} />
-        </Box>
+        <Button
+          variant="plain"
+          color="white"
+          aria-label="NHWeb Services Backups dashboard"
+          onClick={() => navigate("/")}
+          mr={4}
+          px={0}
+        >
+          <Text fontWeight="bold" fontSize={{ base: "sm", lg: "lg" }}>
+            NHWeb Services Backups
+          </Text>
+        </Button>
 
         <Flex align="baseline" gap={4}>
           <Link
-            href="https://github.com/garethgeorge/backrest"
+            href="https://github.com/HenkDz/backrest"
             target="_blank"
             color="whiteAlpha.700"
             fontSize="xs"
             display={{ base: "none", lg: "block" }}
           >
-            {uiBuildVersion}
+            {uiBuildVersion} · Powered by Backrest
           </Link>
           <Box fontSize="xs">
             <ActivityBar />
@@ -963,6 +988,16 @@ export const App: React.FC = () => {
               }
             >
               <Routes>
+                <Route
+                  path="/database-restore"
+                  element={
+                    <MainContentAreaTemplate
+                      breadcrumbs={[{ title: "Database recovery" }]}
+                    >
+                      <DatabaseRestore />
+                    </MainContentAreaTemplate>
+                  }
+                />
                 <Route
                   path="/"
                   element={
@@ -1024,7 +1059,12 @@ const MobileNavTrigger = () => {
       onOpenChange={(e) => setOpen(e.open)}
     >
       <DrawerTrigger asChild>
-        <IconButton variant="ghost" size="sm" color="white" aria-label={m.app_menu()}>
+        <IconButton
+          variant="ghost"
+          size="sm"
+          color="white"
+          aria-label={m.app_menu()}
+        >
           <FiMenu />
         </IconButton>
       </DrawerTrigger>
