@@ -655,37 +655,40 @@ class Workflow:
             os.close(ready_fd)
             try:
                 while True:
-                    with self.transition(job):
-                        current = read_json(self.path(job_id))
-                        if current['phase'] not in {'resuming', 'held', 'containing'}:
-                            return
-                        identity = current['process']
-                        if current['phase'] in {'held', 'containing'} or process_identity(identity['pid']) != identity or not sessions_alive(current):
-                            self.contain(current)
-                    if not select.select([server], [], [], 0.25)[0]:
-                        continue
-                    with server.accept()[0] as connection:
-                        connection.settimeout(10)
-                        data = bytearray()
-                        while b'\n' not in data and len(data) <= 1024:
-                            chunk = connection.recv(1024)
-                            if not chunk:
-                                break
-                            data.extend(chunk)
-                        request = json.loads(data, object_pairs_hook=no_duplicates)
-                        require(set(request) == {'container'} and request['container'] in {item['id'] for item in job['writers']}, 'Unpause executor rejected an unrecorded identity.')
+                    try:
                         with self.transition(job):
                             current = read_json(self.path(job_id))
+                            if current['phase'] not in {'resuming', 'held', 'containing'}:
+                                return
                             identity = current['process']
-                            if current['phase'] != 'resuming' or process_identity(identity['pid']) != identity or not sessions_alive(current):
-                                continue
-                            self.owned_lock(current)
-                            try:
-                                self.system.run(['docker', 'unpause', request['container']])
-                                require(process_identity(identity['pid']) == identity and sessions_alive(current), 'Resume owner disappeared during unpause.')
-                                connection.sendall(b'completed\n')
-                            except Exception:
+                            if current['phase'] in {'held', 'containing'} or process_identity(identity['pid']) != identity or not sessions_alive(current):
                                 self.contain(current)
+                        if not select.select([server], [], [], 0.25)[0]:
+                            continue
+                        with server.accept()[0] as connection:
+                            connection.settimeout(10)
+                            data = bytearray()
+                            while b'\n' not in data and len(data) <= 1024:
+                                chunk = connection.recv(1024)
+                                if not chunk:
+                                    break
+                                data.extend(chunk)
+                            request = json.loads(data, object_pairs_hook=no_duplicates)
+                            require(set(request) == {'container'} and request['container'] in {item['id'] for item in job['writers']}, 'Unpause executor rejected an unrecorded identity.')
+                            with self.transition(job):
+                                current = read_json(self.path(job_id))
+                                identity = current['process']
+                                if current['phase'] != 'resuming' or process_identity(identity['pid']) != identity or not sessions_alive(current):
+                                    continue
+                                self.owned_lock(current)
+                                try:
+                                    self.system.run(['docker', 'unpause', request['container']])
+                                    require(process_identity(identity['pid']) == identity and sessions_alive(current), 'Resume owner disappeared during unpause.')
+                                    connection.sendall(b'completed\n')
+                                except Exception:
+                                    self.contain(current)
+                    except (Refusal, OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError):
+                        time.sleep(0.25)
             finally:
                 path.unlink(missing_ok=True)
 

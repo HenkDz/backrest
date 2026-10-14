@@ -53,6 +53,8 @@ Only the independent executor can issue an unpause; the request worker sends one
 
 Transient Docker inspection/pause failures keep the executor in `containing`; monitoring retries freshly verified identities while retaining protections. The guard also monitors held states for a delayed unpause effect. A role whose identity changed remains an operator incident, with no automatic takeover of its replacement.
 
+Disconnected or malformed private-socket requests and recoverable journal/lock reads do not terminate the guard. It returns to a fresh, mutex-protected phase/owner check, preserving committed resumes and continuing pre-commit containment.
+
 Shared-lock release atomically moves the complete owned lock directory to a uniquely owned release receipt beside it. Ownership metadata is retained, including after an interrupted release. Cleanup retries verify this receipt and never remove a newly acquired foreign lock. Release receipts are small operational records and require separate eventual housekeeping.
 
 A known competing deployment lock refuses before fencing or pausing and leaves the test restore validated. Finish that deployment before trying pause again. Updating worker code/configuration during an open recovery refuses further mutation; finish recovery before upgrading it.
@@ -81,6 +83,8 @@ The native PostgreSQL rehearsal includes an encrypted archive with a restore-tim
 The archive rehearsal additionally poisons candidate search-path/catalog resolution and defers a server-program callback until row validation. Native resume faults run both before and after each Docker effect, plus controlled containment-wins/commit-wins interleavings. Lock-release tests fail after the atomic directory move, retry cleanup and preserve a foreign replacement lock.
 
 An encrypted post-data trigger archive is refused against the trusted executable-schema contract; an application-role write to the preserved active database stays safe afterward. Native faults also exercise one-shot inspect/pause failures and a late unpause after initial containment, with explicit proof that delayed effects occurred before final assertions. Two-job unit tests refuse a stale older rollback and keep the newer candidate discardable.
+
+Native tests additionally kill the worker after web is proven unpaused and the next private socket connects, before any request bytes are transmitted. All five roles must return to paused, the guard must remain alive, and fence/lock ownership must remain intact.
 
 ## Initial limits
 

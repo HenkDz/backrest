@@ -162,6 +162,48 @@ try:
     marker.unlink(missing_ok=True)
     effect.unlink(missing_ok=True)
     fault.unlink(missing_ok=True)
+    socket_marker = Path('/run/nhws-recovery-fixture-empty-socket')
+    socket_marker.unlink(missing_ok=True)
+    socket_child = '''import importlib.util,sys,time
+from pathlib import Path
+spec=importlib.util.spec_from_file_location('r','/usr/local/libexec/nhweb-backups/staging_recovery.py')
+r=importlib.util.module_from_spec(spec);spec.loader.exec_module(r)
+c=r.load_config(r.CONFIG_PATH);s=r.System(c);w=r.Workflow(c,s)
+original=r.socket.socket
+counter=[0]
+class Socket(original):
+ def connect(self,address):
+  super().connect(address)
+  self.guard=isinstance(address,str) and address.endswith('.guard.sock')
+ def sendall(self,data):
+  if getattr(self,'guard',False):
+   counter[0]+=1
+   if counter[0]==2:
+    Path('/run/nhws-recovery-fixture-empty-socket').touch()
+    time.sleep(60)
+  return super().sendall(data)
+r.socket.socket=Socket
+w.handle({'action':'resume','jobId':sys.argv[1],'actor':'synthetic-empty-socket','environment':'staging','confirmation':'RESUME DZDISTRO STAGING '+sys.argv[1][:8],'queuesReconciled':True})
+'''
+    empty_worker = subprocess.Popen([sys.executable, '-c', socket_child, job_id], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    wait_for(socket_marker.exists, 30)
+    assert not next(item['paused'] for item in system.writers() if item['role'] == 'web')
+    empty_pending = recovery.read_json(flow.path(job_id))
+    empty_worker.kill()
+    empty_worker.wait(timeout=10)
+    wait_for(lambda: call('status')['phase'] == 'held' and all(item['paused'] for item in system.writers()))
+    assert recovery.process_identity(empty_pending['guard']['pid']) == empty_pending['guard']
+    flow.owned_lock(empty_pending)
+    assert Path(config['proxyConfig']).exists()
+    receipts.append({'ownerDeathAfterSocketConnectBeforeSend': True, 'webUnpauseProven': True, 'guardSurvives': True, 'allFiveRolesPaused': True, 'protectionsRetained': True})
+    print(json.dumps(receipts[-1]), flush=True)
+    job = recovery.read_json(flow.path(job_id))
+    previous_guard = job['guard']
+    with flow.transition(job):
+        job['phase'] = 'restored'
+        recovery.save_json(flow.path(job_id), job)
+    wait_for(lambda: recovery.process_identity(previous_guard['pid']) != previous_guard)
+    socket_marker.unlink()
     child_code = '''import importlib.util,json,subprocess,sys,time
 from pathlib import Path
 spec=importlib.util.spec_from_file_location('r','/usr/local/libexec/nhweb-backups/staging_recovery.py')
