@@ -2,7 +2,11 @@ import { useState } from "react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { fireEvent, screen, waitFor } from "@testing-library/react";
 import { renderWithProviders as render } from "../../test/render";
-import { BackupPicker, type RecoverySnapshot } from "./BackupPicker";
+import {
+  BackupPicker,
+  SelectedRecoveryPoint,
+  type RecoverySnapshot,
+} from "./BackupPicker";
 const fetchBackups = vi.hoisted(() => vi.fn());
 vi.mock("../../api/client", () => ({ authenticatedFetch: fetchBackups }));
 const a = {
@@ -21,10 +25,25 @@ const page = (snapshots = [a], number = 1) => ({
   pages: 4000,
   latestId: a.id,
 });
+const search = () =>
+  fireEvent.submit(
+    screen.getByRole("textbox", { name: "Search backups" }).closest("form")!,
+  );
 function Harness() {
   const [selected, setSelected] = useState<RecoverySnapshot | null>(null);
   return (
-    <BackupPicker selected={selected} onSelect={setSelected} disabled={false} />
+    <>
+      <SelectedRecoveryPoint
+        selected={selected}
+        onClear={() => setSelected(null)}
+        disabled={false}
+      />
+      <BackupPicker
+        selected={selected}
+        onSelect={setSelected}
+        disabled={false}
+      />
+    </>
   );
 }
 describe("large backup catalog", () => {
@@ -54,7 +73,7 @@ describe("large backup catalog", () => {
       target: { value: "daily" },
     });
     expect(fetchBackups).toHaveBeenCalledTimes(before);
-    fireEvent.click(screen.getByRole("button", { name: "Apply filters" }));
+    search();
     await waitFor(() =>
       expect(String(fetchBackups.mock.calls.at(-1)?.[0])).toContain("q=daily"),
     );
@@ -71,6 +90,7 @@ describe("large backup catalog", () => {
   it("sends date, host, tag, order and bounded page-size filters together", async () => {
     render(<Harness />);
     await screen.findByRole("radio");
+    fireEvent.click(screen.getByRole("button", { name: "More filters" }));
     for (const [label, value] of [
       ["From date", "2026-10-01"],
       ["To date", "2026-10-14"],
@@ -86,7 +106,9 @@ describe("large backup catalog", () => {
       { target: { value: "100" } },
     );
     fireEvent.click(screen.getByRole("button", { name: "Apply filters" }));
-    await waitFor(() => expect(fetchBackups).toHaveBeenCalledTimes(2));
+    await waitFor(() =>
+      expect(String(fetchBackups.mock.calls.at(-1)?.[0])).toContain("from="),
+    );
     const query = new URL(
       String(fetchBackups.mock.calls.at(-1)?.[0]),
       "http://test",
@@ -100,6 +122,32 @@ describe("large backup catalog", () => {
       pageSize: "100",
       page: "1",
     });
+  });
+  it("applies quick date ranges at once and removes single filters", async () => {
+    render(<Harness />);
+    await screen.findByRole("radio");
+    fireEvent.click(screen.getByRole("button", { name: "7 days" }));
+    await waitFor(() => expect(fetchBackups).toHaveBeenCalledTimes(2));
+    const query = new URL(
+      String(fetchBackups.mock.calls.at(-1)?.[0]),
+      "http://test",
+    ).searchParams;
+    const from = new Date(`${query.get("from")}T00:00:00Z`).getTime();
+    const to = new Date(`${query.get("to")}T00:00:00Z`).getTime();
+    expect((to - from) / 86400000).toBe(6);
+    expect(screen.getByRole("button", { name: "7 days" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
+    fireEvent.click(screen.getByRole("button", { name: "Remove from filter" }));
+    await waitFor(() => expect(fetchBackups).toHaveBeenCalledTimes(3));
+    expect(
+      new URL(
+        String(fetchBackups.mock.calls.at(-1)?.[0]),
+        "http://test",
+      ).searchParams.get("from"),
+    ).toBe("");
+    expect(screen.getByText("Custom range")).toBeInTheDocument();
   });
   it("ignores late responses and aborts superseded searches", async () => {
     let resolveOld!: (value: unknown) => void;
@@ -115,7 +163,7 @@ describe("large backup catalog", () => {
     fireEvent.change(screen.getByRole("textbox", { name: "Search backups" }), {
       target: { value: "bbbb" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Apply filters" }));
+    search();
     await screen.findByRole("radio", { name: /bbbbbbbb/ });
     expect(fetchBackups.mock.calls[0][1].signal.aborted).toBe(true);
     resolveOld({ ok: true, json: async () => page([a]) });
@@ -135,7 +183,7 @@ describe("large backup catalog", () => {
     fireEvent.change(screen.getByRole("textbox", { name: "Search backups" }), {
       target: { value: "none" },
     });
-    fireEvent.click(screen.getByRole("button", { name: "Apply filters" }));
+    search();
     await screen.findByText("No backups match these filters.");
     fireEvent.click(screen.getByRole("button", { name: "Clear filters" }));
     expect(screen.getByRole("textbox", { name: "Search backups" })).toHaveValue(

@@ -61,7 +61,7 @@ A known competing deployment lock refuses before fencing or pausing and leaves t
 
 ## Verification
 
-The backup picker shows dated rows, newest first, with Algiers time and an explicit selection. A failed validation keeps that selection and records its safe failure reason for subsequent status refreshes. A rejected test refreshes status without retrying the mutation.
+The backup picker groups rows by Algiers calendar day, newest first, with an explicit selection. Quick ranges (today, 7, 30 and 90 days) apply immediately; host, tag and custom dates sit under **More filters**, and each applied filter shows as a removable chip. Order and page size apply immediately. The selected recovery point, its full snapshot ID and the test action stay in a sticky side panel (a fixed bottom bar on small screens). A stepper shows the current workflow step; transient worker phases refresh status read-only every five seconds, and discarding a test restore uses an in-page confirmation dialog. A failed validation keeps that selection and records its safe failure reason for subsequent status refreshes. A rejected test refreshes status without retrying the mutation.
 
 The required core tables are `public.migrations`, `public.users`, `public.tenants` and `public.documents`, matching DZDistro's tenant model. The PostgreSQL rehearsal uses `tenants` and document `tenant_id` references; it additionally refuses a businesses-only schema while preserving the active OID and rows. Full schema, migration, constraint and executable-object comparisons remain required before cutover.
 
