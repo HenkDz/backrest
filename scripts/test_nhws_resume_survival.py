@@ -102,7 +102,7 @@ try:
         settings = {'container': selected, 'when': when}
         if mode.startswith('transient-'):
             settings['fault'] = mode.removeprefix('transient-')
-        barrier.write_text(json.dumps(settings))
+        recovery.save_json(barrier, settings)
         effect.unlink(missing_ok=True)
         fault.unlink(missing_ok=True)
         if marker.exists():
@@ -126,7 +126,7 @@ try:
         settings = json.loads(barrier.read_text())
         settings['release'] = True
         settings['fail'] = mode == 'journal-write-failure'
-        barrier.write_text(json.dumps(settings))
+        recovery.save_json(barrier, settings)
         wait_for(effect.exists)
         wait_for(lambda: all(item['paused'] for item in system.writers()))
         if mode.startswith('transient-'):
