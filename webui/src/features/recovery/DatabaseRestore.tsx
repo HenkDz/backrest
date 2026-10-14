@@ -11,7 +11,7 @@ import {
 import { authenticatedFetch } from "../../api/client";
 import { backendUrl } from "../../state/buildcfg";
 
-type Snapshot = { id: string; time: string };
+import { BackupPicker, type RecoverySnapshot } from "./BackupPicker";
 export type RecoveryJob = {
   id: string;
   snapshotId: string;
@@ -27,7 +27,6 @@ type RecoveryState = {
   environment: "staging";
   target: string;
   repoId: string;
-  snapshots: Snapshot[];
   job?: RecoveryJob | null;
 };
 
@@ -109,7 +108,8 @@ const descriptions: Record<string, string> = {
 
 export const DatabaseRestore = () => {
   const [state, setState] = useState<RecoveryState | null>(null);
-  const [snapshotId, setSnapshotId] = useState("");
+  const [selected, setSelected] = useState<RecoverySnapshot | null>(null);
+  const snapshotId = selected?.id || "";
   const [confirmation, setConfirmation] = useState("");
   const [reconciled, setReconciled] = useState(false);
   const [busy, setBusy] = useState(false);
@@ -118,13 +118,13 @@ export const DatabaseRestore = () => {
   const next = recoveryAction(job);
   const updateState = (result: RecoveryState) => {
     setState(result);
-    setSnapshotId((current) => {
+    setSelected((current) => {
       const active =
         result.job &&
         !["failed", "aborted", "resumed"].includes(result.job.phase);
-      return active
-        ? result.job!.snapshotId
-        : current || result.job?.snapshotId || "";
+      return active || (!current && result.job)
+        ? { id: result.job!.snapshotId, time: result.job!.snapshotTime || "" }
+        : current;
     });
   };
 
@@ -187,13 +187,7 @@ export const DatabaseRestore = () => {
   }, []);
   const openJob = job && !["failed", "aborted", "resumed"].includes(job.phase);
   const selectionDisabled = busy || !!openJob || !state;
-  const snapshots = [...(state?.snapshots || [])].sort(
-    (a, b) => new Date(b.time).getTime() - new Date(a.time).getTime(),
-  );
-  const canPrepare =
-    !busy &&
-    !openJob &&
-    snapshots.some((snapshot) => snapshot.id === snapshotId);
+  const canPrepare = !busy && !openJob && !!selected;
   const canAdvance =
     !busy &&
     !!next &&
@@ -228,93 +222,14 @@ export const DatabaseRestore = () => {
           Backups remain encrypted with restic. Testing creates an isolated
           database; it does not overwrite staging.
         </Text>
-        <fieldset
+        <BackupPicker
+          selected={selected}
           disabled={!!selectionDisabled}
-          style={{ border: 0, padding: 0, margin: 0, minWidth: 0 }}
-        >
-          <legend>Available backups</legend>
-          <Text color="fg.muted" fontSize="sm" mt={1} mb={3}>
-            Newest first · times shown in Algiers (UTC+1)
-          </Text>
-          <Box maxH="380px" overflowY="auto" mb={4}>
-            {snapshots.map((snapshot, index) => {
-              const date = new Date(snapshot.time);
-              const day = date.toLocaleDateString(undefined, {
-                day: "numeric",
-                month: "long",
-                year: "numeric",
-                timeZone: "Africa/Algiers",
-              });
-              const time = date.toLocaleTimeString(undefined, {
-                hour: "2-digit",
-                minute: "2-digit",
-                hour12: false,
-                timeZone: "Africa/Algiers",
-              });
-              const selected = snapshotId === snapshot.id;
-              return (
-                <Flex
-                  as="label"
-                  key={snapshot.id}
-                  align="center"
-                  gap={4}
-                  p={4}
-                  mb={2}
-                  borderWidth="1px"
-                  borderColor={selected ? "blue.500" : "border"}
-                  bg={selected ? "bg.subtle" : "bg.panel"}
-                  borderRadius="md"
-                  cursor={selectionDisabled ? "not-allowed" : "pointer"}
-                  opacity={selectionDisabled ? 0.6 : 1}
-                  css={{
-                    "&:focus-within": {
-                      outline: "2px solid",
-                      outlineColor: "blue.500",
-                      outlineOffset: "-2px",
-                    },
-                  }}
-                >
-                  <input
-                    type="radio"
-                    name="recovery-snapshot"
-                    value={snapshot.id}
-                    checked={selected}
-                    aria-label={`Backup ${day} at ${time} Algiers, snapshot ${snapshot.id.slice(0, 8)}`}
-                    onChange={() => {
-                      setSnapshotId(snapshot.id);
-                      setError("");
-                    }}
-                  />
-                  <Box flex="1" minW={0}>
-                    <Flex gap={2} align="center" wrap="wrap">
-                      <Text fontWeight="semibold">{day}</Text>
-                      {index === 0 && (
-                        <Text color="blue.fg" fontSize="xs" fontWeight="bold">
-                          Latest backup
-                        </Text>
-                      )}
-                    </Flex>
-                    <Text color="fg.muted" fontSize="sm" mt={1}>
-                      {time} · Snapshot {snapshot.id.slice(0, 8)}
-                    </Text>
-                  </Box>
-                  {selected && (
-                    <Text fontSize="sm" fontWeight="bold">
-                      Selected
-                    </Text>
-                  )}
-                </Flex>
-              );
-            })}
-            {snapshots.length === 0 && (
-              <Text color="fg.muted" py={3}>
-                {state
-                  ? "No recovery backups are available."
-                  : "Loading backups…"}
-              </Text>
-            )}
-          </Box>
-        </fieldset>
+          onSelect={(snapshot) => {
+            setSelected(snapshot);
+            setError("");
+          }}
+        />
         <Button disabled={!canPrepare} onClick={() => void request("prepare")}>
           Test restore into isolated database
         </Button>

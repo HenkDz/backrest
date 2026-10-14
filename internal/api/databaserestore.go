@@ -13,6 +13,7 @@ import (
 	"regexp"
 	"runtime"
 	"slices"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -51,16 +52,24 @@ type recoveryReply struct {
 }
 
 type recoverySnapshot struct {
-	ID   string `json:"id"`
-	Time string `json:"time"`
+	ID       string   `json:"id"`
+	Time     string   `json:"time"`
+	Hostname string   `json:"hostname"`
+	Tags     []string `json:"tags"`
+	at       time.Time
+	search   string
 }
 
 type databaseRestoreHandler struct {
-	orch          *orchestrator.Orchestrator
-	configPath    string
-	run           func(context.Context, DatabaseRestoreConfig, recoveryRequest) (recoveryReply, error)
-	listSnapshots func(context.Context, DatabaseRestoreConfig) ([]recoverySnapshot, error)
-	mu            sync.Mutex
+	orch           *orchestrator.Orchestrator
+	configPath     string
+	run            func(context.Context, DatabaseRestoreConfig, recoveryRequest) (recoveryReply, error)
+	listSnapshots  func(context.Context, DatabaseRestoreConfig, bool) ([]recoverySnapshot, error)
+	mu             sync.Mutex
+	snapshotMu     sync.Mutex
+	snapshotGUID   string
+	snapshotLoaded time.Time
+	snapshotCache  []recoverySnapshot
 }
 
 var recoveryID = regexp.MustCompile(`^[0-9a-f]{32}$`)
@@ -100,11 +109,34 @@ func readRecoveryConfig(path string) (DatabaseRestoreConfig, error) {
 	return cfg, nil
 }
 
-func (h *databaseRestoreHandler) snapshots(ctx context.Context, cfg DatabaseRestoreConfig) ([]recoverySnapshot, error) {
+func (h *databaseRestoreHandler) snapshots(ctx context.Context, cfg DatabaseRestoreConfig, fresh bool) ([]recoverySnapshot, error) {
 	repo, err := h.orch.GetRepo(cfg.RepoID)
 	if err != nil || repo.Guid != cfg.RepoGUID || repo.OriginInstanceId != "" {
 		return nil, errors.New("staging repository identity changed")
 	}
+	return h.cachedSnapshots(ctx, cfg.RepoGUID, fresh, func() ([]recoverySnapshot, error) {
+		return h.loadSnapshots(ctx, cfg)
+	})
+}
+
+func (h *databaseRestoreHandler) cachedSnapshots(ctx context.Context, guid string, fresh bool, load func() ([]recoverySnapshot, error)) ([]recoverySnapshot, error) {
+	h.snapshotMu.Lock()
+	defer h.snapshotMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if !fresh && h.snapshotGUID == guid && time.Since(h.snapshotLoaded) < time.Minute {
+		return h.snapshotCache, nil
+	}
+	result, err := load()
+	if err != nil {
+		return nil, err
+	}
+	h.snapshotCache, h.snapshotGUID, h.snapshotLoaded = result, guid, time.Now()
+	return result, nil
+}
+
+func (h *databaseRestoreHandler) loadSnapshots(ctx context.Context, cfg DatabaseRestoreConfig) ([]recoverySnapshot, error) {
 	runner, err := h.orch.GetRepoOrchestrator(cfg.RepoID)
 	if err != nil {
 		return nil, errors.New("staging repository is unavailable")
@@ -120,11 +152,21 @@ func (h *databaseRestoreHandler) snapshots(ctx context.Context, cfg DatabaseRest
 		}
 		for _, path := range snapshot.Paths {
 			if path == "dzdistro_staging.dump" || path == "/dzdistro_staging.dump" {
-				result = append(result, recoverySnapshot{snapshot.Id, snapshot.Time})
+				at, err := time.Parse(time.RFC3339Nano, snapshot.Time)
+				if err != nil {
+					continue
+				}
+				result = append(result, recoverySnapshot{ID: snapshot.Id, Time: snapshot.Time, Hostname: snapshot.Hostname, Tags: snapshot.Tags, at: at, search: strings.ToLower(snapshot.Id + " " + snapshot.Hostname + " " + strings.Join(snapshot.Tags, " "))})
 				break
 			}
 		}
 	}
+	sort.Slice(result, func(i, j int) bool {
+		if result[i].at.Equal(result[j].at) {
+			return result[i].ID < result[j].ID
+		}
+		return result[i].at.After(result[j].at)
+	})
 	return result, nil
 }
 
@@ -157,6 +199,10 @@ func (h *databaseRestoreHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	}
 	if !slices.Contains(cfg.Operators, user.GetName()) {
 		recoveryJSON(w, 403, map[string]string{"error": "Your account is not authorized for staging database recovery."})
+		return
+	}
+	if r.Method == http.MethodGet && r.URL.Query().Get("view") == "snapshots" {
+		h.serveSnapshotPage(w, r, cfg)
 		return
 	}
 	request := recoveryRequest{Action: "status", JobID: r.URL.Query().Get("jobId")}
@@ -194,12 +240,19 @@ func (h *databaseRestoreHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Minute)
 	defer cancel()
-	snapshots, err := h.listSnapshots(ctx, cfg)
-	if err != nil {
-		recoveryJSON(w, 409, map[string]string{"error": err.Error()})
+	if r.Method == http.MethodPost && !h.mu.TryLock() {
+		recoveryJSON(w, 409, map[string]string{"error": "Another recovery request is running. Refresh its status before retrying."})
 		return
 	}
+	if r.Method == http.MethodPost {
+		defer h.mu.Unlock()
+	}
 	if request.Action == "prepare" {
+		snapshots, err := h.listSnapshots(ctx, cfg, true)
+		if err != nil {
+			recoveryJSON(w, 409, map[string]string{"error": err.Error()})
+			return
+		}
 		found := false
 		for _, snapshot := range snapshots {
 			found = found || snapshot.ID == request.SnapshotID
@@ -208,13 +261,6 @@ func (h *databaseRestoreHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 			recoveryJSON(w, 400, map[string]string{"error": "Snapshot is not in the configured staging repository."})
 			return
 		}
-	}
-	if r.Method == http.MethodPost && !h.mu.TryLock() {
-		recoveryJSON(w, 409, map[string]string{"error": "Another recovery request is running. Refresh its status before retrying."})
-		return
-	}
-	if r.Method == http.MethodPost {
-		defer h.mu.Unlock()
 	}
 	request.Environment, request.Actor = "staging", user.GetName()
 	reply, err := h.run(ctx, cfg, request)
@@ -246,9 +292,8 @@ func (h *databaseRestoreHandler) ServeHTTP(w http.ResponseWriter, r *http.Reques
 	}
 	recoveryJSON(w, 200, struct {
 		recoveryReply
-		RepoID    string             `json:"repoId"`
-		Snapshots []recoverySnapshot `json:"snapshots"`
-	}{reply, cfg.RepoID, snapshots})
+		RepoID string `json:"repoId"`
+	}{reply, cfg.RepoID})
 }
 
 func runRecoverySSH(ctx context.Context, cfg DatabaseRestoreConfig, request recoveryRequest) (recoveryReply, error) {

@@ -28,8 +28,8 @@ func recoveryFixture(t *testing.T) (*databaseRestoreHandler, *int) {
 	}
 	calls := new(int)
 	handler := &databaseRestoreHandler{configPath: path,
-		listSnapshots: func(context.Context, DatabaseRestoreConfig) ([]recoverySnapshot, error) {
-			return []recoverySnapshot{{testRecoverySnapshot, "2026-10-14T01:00:00Z"}}, nil
+		listSnapshots: func(context.Context, DatabaseRestoreConfig, bool) ([]recoverySnapshot, error) {
+			return []recoverySnapshot{{ID: testRecoverySnapshot, Time: "2026-10-14T01:00:00Z"}}, nil
 		},
 		run: func(_ context.Context, _ DatabaseRestoreConfig, request recoveryRequest) (recoveryReply, error) {
 			*calls++
