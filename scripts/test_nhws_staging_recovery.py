@@ -34,6 +34,7 @@ class FakeSystem:
 
     def prepare(self, job, dump, persist):
         self.events.append('isolated-restore')
+        job['sourceValidation'] = self.validate(recovery.DATABASE)
         dump.write_bytes(b'PGDMPsynthetic-archive')
         job['candidateOID'] = 20
         self.databases[job['candidateDatabase']] = 20
@@ -135,6 +136,30 @@ class RecoveryTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.call('prepare', snapshotId=SNAPSHOT)
         self.assertNotIn('private credential', self.call('status')['failureReason'])
+
+    def test_source_schema_drift_refuses_before_freeze(self):
+        self.call('prepare', snapshotId=SNAPSHOT)
+        self.system.validate = lambda database, role=None: {'schemaHash': 'changed-source'}
+        with self.assertRaises(recovery.Refusal):
+            self.call('freeze', 'PAUSE DZDISTRO STAGING')
+        self.assertFalse(self.system.fenced)
+        self.assertFalse(self.system.paused)
+        self.assertFalse(recovery.ROLLOUT_LOCK.exists())
+
+    def test_reference_cleanup_refuses_changed_oid_or_owner(self):
+        for oid, owner in [(99, 'expected-role'), (42, 'foreign-role')]:
+            with self.subTest(oid=oid, owner=owner):
+                system = object.__new__(recovery.System)
+                events = []
+                system.oid = lambda name: oid
+                def sql(query):
+                    events.append(query)
+                    return owner
+                system.sql = sql
+                job = {'id': JOB, 'referenceDatabase': 'dzdistro_schema_' + JOB, 'referenceOID': 42, 'candidateRole': 'expected-role'}
+                with self.assertRaises(recovery.Refusal):
+                    system.drop_reference(job)
+                self.assertFalse(any(query.startswith('DROP DATABASE') for query in events))
 
     def prepare(self):
         return self.call('prepare', snapshotId=SNAPSHOT)

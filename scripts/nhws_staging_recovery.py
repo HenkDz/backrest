@@ -186,7 +186,8 @@ class System:
         require(sql("SELECT count(*) FROM pg_catalog.pg_constraint WHERE connamespace='public'::regnamespace AND NOT convalidated") == '0', 'Database constraints are not validated.')
         schema = sql("SELECT table_name||':'||column_name||':'||data_type||':'||is_nullable||':'||coalesce(column_default,'') FROM information_schema.columns WHERE table_schema='public' ORDER BY table_name,ordinal_position")
         schema += '\n' + sql("SELECT conrelid::regclass::text||':'||contype::text||':'||pg_get_constraintdef(oid) FROM pg_catalog.pg_constraint WHERE connamespace='public'::regnamespace ORDER BY conrelid::regclass::text,conname")
-        schema += '\n' + sql("SELECT migration FROM public.migrations ORDER BY migration")
+        migrations = sql("SELECT migration FROM public.migrations ORDER BY migration")
+        schema += '\n' + migrations
         schema += '\n' + sql("SELECT indexdef FROM pg_catalog.pg_indexes WHERE schemaname='public' ORDER BY tablename,indexname")
         schema += '\n' + sql("SELECT n.nspname||':'||p.proname||':'||pg_get_functiondef(p.oid) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname NOT LIKE 'pg_%' AND n.nspname<>'information_schema' AND p.prokind IN ('f','p') ORDER BY n.nspname,p.proname,pg_get_function_identity_arguments(p.oid)")
         schema += '\n' + sql("SELECT n.nspname||':'||c.relname||':'||pg_get_triggerdef(t.oid) FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid=t.tgrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE NOT t.tgisinternal AND n.nspname NOT LIKE 'pg_%' ORDER BY n.nspname,c.relname,t.tgname")
@@ -198,9 +199,13 @@ class System:
         # pg_dump's random psql restriction token and ownership headers are transport metadata.
         canonical = '\n'.join(line for line in dump.splitlines() if not line.startswith(('\\restrict ', '\\unrestrict ', '--')))
         schema += '\n' + canonical
-        schema += '\n' + sql("SELECT s.setconfig::text FROM pg_catalog.pg_db_role_setting s JOIN pg_catalog.pg_database d ON d.oid=s.setdatabase WHERE d.datname='" + database + "' AND s.setrole=0 ORDER BY s.setconfig::text")
+        settings = sql("SELECT s.setconfig::text FROM pg_catalog.pg_db_role_setting s JOIN pg_catalog.pg_database d ON d.oid=s.setdatabase WHERE d.datname='" + database + "' AND s.setrole=0 ORDER BY s.setconfig::text")
+        schema += '\n' + settings
         counts = {table: int(sql('SELECT count(*) FROM public.' + '"' + table.replace('"', '""') + '"')) for table in tables}
-        return {'schemaHash': hashlib.sha256(schema.encode()).hexdigest(), 'tables': len(tables), 'rows': sum(counts.values()), 'tableRows': counts}
+        return {'schemaHash': hashlib.sha256(schema.encode()).hexdigest(),
+                'migrationsHash': hashlib.sha256(migrations.encode()).hexdigest(),
+                'settingsHash': hashlib.sha256(settings.encode()).hexdigest(),
+                'tables': len(tables), 'rows': sum(counts.values()), 'tableRows': counts}
 
     def restic(self, args, *, output=None):
         env = os.environ.copy()
@@ -216,6 +221,35 @@ class System:
         result = subprocess.run(command + args, env=env, stdout=output or subprocess.PIPE, stderr=subprocess.PIPE, timeout=1200, preexec_fn=bound_file if output else None)
         require(result.returncode == 0, 'Encrypted snapshot could not be read; no database switch was made.')
         return result.stdout
+
+    def drop_reference(self, job):
+        oid = job.get('referenceOID')
+        if oid is None:
+            return
+        name = job['referenceDatabase']
+        require(name == 'dzdistro_schema_' + job['id'] and self.oid(name) == oid, 'Schema reference identity changed; inspect the recovery journal.')
+        require(self.sql("SELECT pg_get_userbyid(datdba) FROM pg_catalog.pg_database WHERE oid=" + str(oid)) == job['candidateRole'], 'Schema reference owner changed.')
+        self.sql('DROP DATABASE ' + identifier(name) + ' WITH (FORCE)')
+        job['referenceOID'] = None
+
+    def schema_reference(self, job, persist):
+        role = job['candidateRole']
+        name = 'dzdistro_schema_' + job['id']
+        require(self.oid(name) is None, 'Schema reference database already exists.')
+        schema = self.run(['docker', 'exec', '-e', 'PGOPTIONS=-c search_path=pg_catalog', self.target_id, 'pg_dump', '-Fc', '--schema-only', '--no-owner', '--no-acl', '--no-comments', '-U', DATABASE, '-d', DATABASE])
+        migrations = self.run(['docker', 'exec', '-e', 'PGOPTIONS=-c search_path=pg_catalog', self.target_id, 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '-U', DATABASE, '-d', DATABASE, '-c', 'COPY public.migrations TO STDOUT'])
+        job['referenceDatabase'] = name
+        self.sql('CREATE DATABASE ' + identifier(name) + ' TEMPLATE template0 OWNER ' + identifier(role))
+        job['referenceOID'] = self.oid(name)
+        persist(job)
+        try:
+            # Reparse trusted DDL before importing the archive; PostgreSQL rewrites CHECK casts.
+            self.run(['docker', 'exec', '-i', self.target_id, 'pg_restore', '--exit-on-error', '--single-transaction', '--no-owner', '--no-acl', '-U', role, '-d', name], data=schema, timeout=1200)
+            self.run(['docker', 'exec', '-i', '-e', 'PGOPTIONS=-c search_path=pg_catalog', self.target_id, 'psql', '-X', '-v', 'ON_ERROR_STOP=1', '--single-transaction', '-U', role, '-d', name, '-c', 'COPY public.migrations FROM STDIN'], data=migrations)
+            return self.validate(name, role)
+        finally:
+            self.drop_reference(job)
+            persist(job)
 
     def prepare(self, job, dump_path, persist):
         repository = json.loads(self.restic(['cat', 'config']))
@@ -233,6 +267,7 @@ class System:
         with dump_path.open('rb') as dump:
             job['dumpSha256'] = hashlib.file_digest(dump, 'sha256').hexdigest()
         job['dumpBytes'] = dump_path.stat().st_size
+        job['sourceValidation'] = self.validate(DATABASE)
         require(self.oid(job['candidateDatabase']) is None, 'Candidate database already exists.')
         role = 'dzdistro_recovery_' + job['id']
         require(self.sql("SELECT rolsuper FROM pg_roles WHERE rolname='" + DATABASE + "'") == 't', 'The pinned staging application role must retain access to recovered objects.')
@@ -240,6 +275,9 @@ class System:
         self.sql('CREATE ROLE ' + identifier(role) + ' LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD NULL')
         job['candidateRole'] = role
         persist(job)
+        reference = self.schema_reference(job, persist)
+        require(reference['migrationsHash'] == job['sourceValidation']['migrationsHash'], 'Staging migrations changed while building the schema reference.')
+        self.sql('ALTER ROLE ' + identifier(role) + ' LOGIN')
         self.sql('CREATE DATABASE ' + identifier(job['candidateDatabase']) + ' TEMPLATE template0 OWNER ' + identifier(role))
         job['candidateOID'] = self.oid(job['candidateDatabase'])
         persist(job)
@@ -248,8 +286,10 @@ class System:
         require(result.returncode == 0, 'Isolated PostgreSQL restore failed. Current staging was not replaced.')
         self.sql('ALTER ROLE ' + identifier(role) + ' NOLOGIN')
         job['validation'] = self.validate(job['candidateDatabase'], role)
-        current = self.validate(DATABASE)
-        require(current['schemaHash'] == job['validation']['schemaHash'], 'Snapshot schema is incompatible with the current staging application.')
+        require(reference['schemaHash'] == job['validation']['schemaHash'] and
+                job['sourceValidation']['migrationsHash'] == job['validation']['migrationsHash'] and
+                job['sourceValidation']['settingsHash'] == job['validation']['settingsHash'], 'Snapshot schema is incompatible with the current staging application.')
+        require(self.validate(DATABASE)['schemaHash'] == job['sourceValidation']['schemaHash'], 'Staging schema changed during backup validation.')
         self.sql('ALTER DATABASE ' + identifier(job['candidateDatabase']) + ' ALLOW_CONNECTIONS false')
 
     def writers(self):
@@ -487,6 +527,8 @@ class Workflow:
             except Exception as error:
                 job['phase'] = 'failed'
                 job['failureReason'] = str(error) if isinstance(error, Refusal) else 'The isolated restore could not be validated. Inspect the restricted worker logs.'
+                if job.get('referenceOID'):
+                    self.system.drop_reference(job)
                 if job.get('candidateOID') and self.system.oid(job['candidateDatabase']) == job['candidateOID']:
                     self.system.sql('DROP DATABASE ' + identifier(job['candidateDatabase']) + ' WITH (FORCE)')
                     job['candidateOID'] = None
@@ -515,7 +557,8 @@ class Workflow:
             require(job['phase'] == expected_phase and not (action == 'freeze-rollback' and job.get('rolledBack')), 'Job is not eligible for this pause.')
             expected_oid = job['originalOID'] if action == 'freeze' else job['candidateOID']
             require(self.system.oid(DATABASE) == expected_oid, 'Current staging database belongs to another recovery.')
-            require(self.system.validate(DATABASE, job.get('candidateRole') if action == 'freeze-rollback' else None)['schemaHash'] == job['validation']['schemaHash'], 'Staging schema changed after validation.')
+            expected_schema = job['sourceValidation'] if action == 'freeze' else job['validation']
+            require(self.system.validate(DATABASE, job.get('candidateRole') if action == 'freeze-rollback' else None)['schemaHash'] == expected_schema['schemaHash'], 'Staging schema changed after validation.')
             job['writers'] = self.system.writers()
             require([{k: item[k] for k in ['id', 'image', 'configHash']} for item in job['writers']] == [{k: item[k] for k in ['id', 'image', 'configHash']} for item in job['validationWriters']], 'Staging release changed after the test restore; validate again.')
             require(not any(item['paused'] for item in job['writers']), 'Another operator already paused staging.')
@@ -570,7 +613,8 @@ class Workflow:
             self.owned_lock(job)
             expected_oid = job['originalOID'] if job.get('rolledBack') else job['candidateOID']
             require(self.system.oid(DATABASE) == expected_oid, 'Active database identity changed.')
-            require(self.system.validate(DATABASE, None if job.get('rolledBack') else job.get('candidateRole'))['schemaHash'] == job['validation']['schemaHash'], 'Restored staging schema did not validate.')
+            expected_schema = job['sourceValidation'] if job.get('rolledBack') else job['validation']
+            require(self.system.validate(DATABASE, None if job.get('rolledBack') else job.get('candidateRole'))['schemaHash'] == expected_schema['schemaHash'], 'Restored staging schema did not validate.')
             self.system.verify_writers(job, True)
             self.system.probe_fence(job)
             self.audit(request, 'intent-after-operator-queue-cache-checks')

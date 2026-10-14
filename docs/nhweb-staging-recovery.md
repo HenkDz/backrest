@@ -65,6 +65,8 @@ The backup picker shows dated rows, newest first, with Algiers time and an expli
 
 The required core tables are `public.migrations`, `public.users`, `public.tenants` and `public.documents`, matching DZDistro's tenant model. The PostgreSQL rehearsal uses `tenants` and document `tenant_id` references; it additionally refuses a businesses-only schema while preserving the active OID and rows. Full schema, migration, constraint and executable-object comparisons remain required before cutover.
 
+PostgreSQL can rewrite equivalent CHECK expressions when reparsing a dump. Preparation therefore restores the trusted current schema and migration metadata into a temporary restricted schema-reference database, reads its server-normalized fingerprint, and drops it before importing the untrusted backup. Constraint, executable-object and full DDL comparisons remain intact; original migration and database-setting hashes must also match. The original raw staging fingerprint remains bound to pause and pre-recovery rollback/resume checks, while restored-database checks use the validated archive fingerprint. A schema change during validation refuses the test. Interrupted reference creation/cleanup stays an operator incident; its recorded OID and owner must match before removal.
+
 Frontend uses the upstream locked dependencies; no application dependency was added. With pnpm12, allow only the two existing build dependencies when installing: `pnpm install --frozen-lockfile --allow-build=esbuild --allow-build=@parcel/watcher`. Node24 is used for the upstream jsdom test harness; Node26's native Web Storage currently conflicts with that harness. No global Node version switch is needed.
 
 Focused checks:

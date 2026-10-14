@@ -72,7 +72,7 @@ with tempfile.TemporaryDirectory(prefix='nhws-pg-rehearsal-') as temporary:
     system.sql('''CREATE TABLE public.migrations(id serial PRIMARY KEY, migration text NOT NULL, batch int NOT NULL);
 CREATE TABLE public.users(id serial PRIMARY KEY, name text NOT NULL);
 CREATE TABLE public.tenants(id serial PRIMARY KEY, user_id int NOT NULL REFERENCES public.users(id));
-CREATE TABLE public.documents(id serial PRIMARY KEY, tenant_id int NOT NULL REFERENCES public.tenants(id), amount numeric(12,2) NOT NULL CHECK(amount>=0));
+CREATE TABLE public.documents(id serial PRIMARY KEY, tenant_id int NOT NULL REFERENCES public.tenants(id), amount numeric(12,2) NOT NULL CHECK(amount>=0), lifecycle_status varchar(16) NOT NULL DEFAULT 'confirmed' CHECK(lifecycle_status IN ('pending','confirmed','voided')));
 INSERT INTO public.migrations(migration,batch) VALUES('synthetic_initial_schema',1);
 INSERT INTO public.users(name) VALUES('Synthetic operator');
 INSERT INTO public.tenants(user_id) VALUES(1);
@@ -100,7 +100,23 @@ INSERT INTO public.documents(tenant_id,amount) VALUES(1,100.00);''', recovery.DA
     def call(action, confirmation='', **extra):
         return flow.handle({'action': action, 'jobId': job_id, 'environment': 'staging', 'actor': 'synthetic-operator', 'confirmation': confirmation} | extra)
 
-    job = call('prepare', snapshotId=snapshot)
+    original_run = subprocess.run
+    imports = []
+    def checked_import(args, **kwargs):
+        if 'pg_restore' in args:
+            name = args[args.index('-d') + 1]
+            if name.startswith('dzdistro_restore_'):
+                assert system.oid('dzdistro_schema_' + name.removeprefix('dzdistro_restore_')) is None
+                imports.append(True)
+        return original_run(args, **kwargs)
+    subprocess.run = checked_import
+    try:
+        job = call('prepare', snapshotId=snapshot)
+    finally:
+        subprocess.run = original_run
+    assert imports == [True], 'Untrusted archive did not import after reference removal'
+    assert job['sourceValidation']['schemaHash'] != job['validation']['schemaHash'], 'CHECK round-trip regression did not exercise PostgreSQL expression rewriting'
+    assert job['referenceOID'] is None and system.oid(job['referenceDatabase']) is None
     assert job['phase'] == 'validated' and job['validation']['tables'] == 4 and job['validation']['rows'] == 4
     assert job['dumpSha256'] == hashlib.sha256(dump).hexdigest()
     assert not list((root / 'state').glob('*.dump'))
