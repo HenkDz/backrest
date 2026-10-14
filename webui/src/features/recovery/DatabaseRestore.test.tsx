@@ -85,25 +85,40 @@ describe("guided staging recovery", () => {
     expect(button).toBeEnabled();
   });
 
-  it("holds resume until the operator reconciles queued work and caches", async () => {
-    fetchRecovery.mockResolvedValue({
-      ok: true,
-      json: async () => ({
-        environment: "staging",
-        snapshots: [],
-        job: { ...baseJob, phase: "restored" },
-      }),
-    });
-    render(<DatabaseRestore />);
-    const button = await screen.findByRole("button", {
-      name: "Resume staging",
-    });
-    fireEvent.change(
-      screen.getByRole("textbox", { name: "Recovery confirmation" }),
-      { target: { value: "RESUME DZDISTRO STAGING bbbbbbbb" } },
-    );
-    expect(button).toBeDisabled();
-    fireEvent.click(screen.getByRole("checkbox"));
-    expect(button).toBeEnabled();
-  });
+  it.each(["restored", "resume-committed"])(
+    "requires reconciliation before resuming %s",
+    async (phase) => {
+      fetchRecovery.mockResolvedValue({
+        ok: true,
+        json: async () => ({
+          environment: "staging",
+          snapshots: [],
+          job: { ...baseJob, phase },
+        }),
+      });
+      render(<DatabaseRestore />);
+      const button = await screen.findByRole("button", {
+        name:
+          phase === "resume-committed"
+            ? "Finish resume cleanup"
+            : "Resume staging",
+      });
+      fireEvent.change(
+        screen.getByRole("textbox", { name: "Recovery confirmation" }),
+        { target: { value: "RESUME DZDISTRO STAGING bbbbbbbb" } },
+      );
+      expect(button).toBeDisabled();
+      fireEvent.click(screen.getByRole("checkbox"));
+      expect(button).toBeEnabled();
+      fireEvent.click(button);
+      await waitFor(() =>
+        expect(JSON.parse(fetchRecovery.mock.calls.at(-1)![1].body)).toEqual({
+          action: "resume",
+          jobId,
+          confirmation: "RESUME DZDISTRO STAGING bbbbbbbb",
+          queuesReconciled: true,
+        }),
+      );
+    },
+  );
 });

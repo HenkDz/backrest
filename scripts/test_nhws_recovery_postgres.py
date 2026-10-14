@@ -25,6 +25,11 @@ class PostgreSQLRehearsal(recovery.System):
     def fence(self, job, enable):
         self.fenced = enable
         job['fenceHash'] = 'synthetic-fence'
+        path = Path(self.config['proxyConfig'])
+        if enable:
+            path.write_text('synthetic-fence')
+        else:
+            path.unlink()
 
     def probe_fence(self, job):
         assert self.fenced
@@ -38,6 +43,12 @@ class PostgreSQLRehearsal(recovery.System):
     def probe_web(self, job):
         assert self.sql('SELECT count(*) FROM documents', recovery.DATABASE) in {'1', '2'}
 
+    def start_guard(self, job):
+        return {'test': 'guard adapter; survival is tested separately'}
+
+    def check_guard(self, job):
+        pass
+
 
 with tempfile.TemporaryDirectory(prefix='nhws-pg-rehearsal-') as temporary:
     root = Path(temporary)
@@ -50,7 +61,7 @@ with tempfile.TemporaryDirectory(prefix='nhws-pg-rehearsal-') as temporary:
     subprocess.run(command + ['init'], env=env, check=True, stdout=subprocess.DEVNULL)
     repository_id = json.loads(subprocess.check_output(command + ['cat', 'config'], env=env))['id']
     config = {'container': container, 'repository': str(repo), 'repositoryId': repository_id,
-              'passwordFile': str(password), 'stateDir': str(root / 'state'), 'environment': 'staging'}
+              'passwordFile': str(password), 'stateDir': str(root / 'state'), 'environment': 'staging', 'proxyConfig': str(root / 'fence.yml')}
     system = PostgreSQLRehearsal(config)
     system.paused, system.fenced = False, False
     system.sql('''CREATE TABLE migrations(id serial PRIMARY KEY, migration text NOT NULL, batch int NOT NULL);
@@ -90,8 +101,32 @@ INSERT INTO documents(business_id,amount) VALUES(1,100.00);''', recovery.DATABAS
     assert system.sql('SELECT sum(amount) FROM documents', recovery.DATABASE) == '300.00'
     assert system.oid(job['afterDatabase']) == job['candidateOID']
     call('resume', 'RESUME DZDISTRO STAGING ' + job_id[:8], queuesReconciled=True)
+    active_oid = system.oid(recovery.DATABASE)
+    system.sql('''CREATE FUNCTION archive_callback() RETURNS boolean LANGUAGE plpgsql AS $function$
+BEGIN
+ IF current_database() LIKE 'dzdistro_restore_%' THEN
+  EXECUTE $command$COPY (SELECT 1) TO PROGRAM 'psql -U dzdistro_staging -d dzdistro_staging -c "TRUNCATE documents"'$command$;
+ END IF;
+ RETURN true;
+END $function$;
+ALTER TABLE documents ADD CONSTRAINT archive_callback_check CHECK (archive_callback());''', recovery.DATABASE)
+    hostile_dump = subprocess.check_output(['docker', 'exec', system.target_id, 'pg_dump', '-U', recovery.DATABASE, '-d', recovery.DATABASE, '-Fc', '--no-owner', '--no-acl'])
+    subprocess.run(command + ['backup', '--stdin', '--stdin-filename', 'dzdistro_staging.dump', '--tag', 'staging-postgres'], input=hostile_dump, env=env, check=True, stdout=subprocess.DEVNULL)
+    hostile_snapshot = json.loads(subprocess.check_output(command + ['snapshots', '--json'], env=env))[-1]['id']
+    job_id = 'd' * 32
+    try:
+        call('prepare', snapshotId=hostile_snapshot)
+        raise AssertionError('Archive callback unexpectedly passed')
+    except recovery.Refusal:
+        pass
+    assert call('status')['phase'] == 'failed'
+    assert system.oid(recovery.DATABASE) == active_oid
+    assert system.sql('SELECT count(*) FROM documents', recovery.DATABASE) == '2'
+    assert system.sql('SELECT sum(amount) FROM documents', recovery.DATABASE) == '300.00'
+    assert not list((root / 'state').glob('*.dump'))
     print(json.dumps({'real_postgresql_restore': 'PASS', 'native_restic_encryption_and_decryption': 'PASS',
                       'archive_sha256_matches': True, 'snapshot_documents': 1, 'restored_total': '100.00',
                       'rollback_documents': 2, 'rollback_total': '300.00', 'original_database_retained': True,
                       'post_restore_database_retained_after_rollback': True, 'plaintext_dump_removed': True,
+                      'encrypted_restore_callback_cannot_modify_active_staging': True,
                       'scope': 'synthetic local PostgreSQL17; fence/writer adapter in this test is simulated'}))

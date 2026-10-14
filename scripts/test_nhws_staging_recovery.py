@@ -16,7 +16,7 @@ class FakeSystem:
     def __init__(self):
         self.databases = {recovery.DATABASE: 10}
         self.rows = {10: 2, 20: 1}
-        self.paused = False
+        self.states = {role: False for role in ['web', 'queue', 'scheduler', 'pulse', 'release']}
         self.fenced = False
         self.events = []
         self.drift = False
@@ -42,29 +42,43 @@ class FakeSystem:
         persist(job)
 
     def writers(self):
-        return [{'id': role, 'role': role, 'image': 'same-image', 'configHash': 'same-config', 'paused': self.paused} for role in ['web', 'queue', 'scheduler', 'pulse', 'release']]
+        return [{'id': role, 'role': role, 'image': 'same-image', 'configHash': 'same-config', 'paused': self.states[role]} for role in ['web', 'queue', 'scheduler', 'pulse', 'release']]
+
+    @property
+    def paused(self):
+        return all(self.states.values())
 
     def verify_writers(self, job, paused):
-        recovery.require(not self.drift and self.paused == paused, 'Writer identity or state changed.')
+        recovery.require(not self.drift and all(state == paused for state in self.states.values()), 'Writer identity or state changed.')
 
     def fence(self, job, enabled):
         self.events.append('fence-on' if enabled else 'fence-off')
         self.fenced = enabled
         job['fenceHash'] = 'owned-fence'
+        if enabled:
+            self.fence_path.write_text('owned-fence')
+        else:
+            self.fence_path.unlink()
 
     def probe_fence(self, job):
         recovery.require(self.fenced, 'Maintenance fence is not active.')
 
     def pause(self, container, paused):
         self.events.append(('pause-' if paused else 'unpause-') + container)
-        self.paused = paused
+        self.states[container] = paused
 
     def probe_web(self, job):
         self.events.append('probe-web')
 
     def hold_writers(self, job):
         self.events.append('re-pause-writers')
-        self.paused = True
+        self.states = dict.fromkeys(self.states, True)
+
+    def start_guard(self, job):
+        return {'test': 'independent-guard'}
+
+    def check_guard(self, job):
+        pass
 
     def switch(self, job, rollback):
         self.events.append('switch')
@@ -88,8 +102,9 @@ class RecoveryTests(unittest.TestCase):
         self.root = Path(self.temp.name)
         recovery.ROLLOUT_LOCK = self.root / 'rollout.lock'
         recovery.FENCE_STATE = self.root / 'fence.json'
-        self.config = {'stateDir': str(self.root / 'private-state'), 'environment': 'staging'}
+        self.config = {'stateDir': str(self.root / 'private-state'), 'environment': 'staging', 'proxyConfig': str(self.root / 'fence.yml')}
         self.system = FakeSystem()
+        self.system.fence_path = Path(self.config['proxyConfig'])
         self.flow = recovery.Workflow(self.config, self.system)
 
     def tearDown(self):
@@ -210,6 +225,64 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(self.call('status')['phase'], 'held')
         self.assertTrue(self.system.paused and self.system.fenced and recovery.ROLLOUT_LOCK.exists())
         self.assertNotIn('unpause-queue', self.system.events)
+
+    def test_containment_runs_even_when_held_journal_cannot_be_written(self):
+        self.prepare()
+        self.freeze()
+        self.restore()
+        persist = self.flow.persist
+        def write(job):
+            if job['phase'] == 'held':
+                raise OSError('ENOSPC')
+            persist(job)
+        self.flow.persist = write
+        self.system.probe_web = lambda job: (_ for _ in ()).throw(recovery.Refusal('Health failed'))
+        with self.assertRaises(OSError):
+            self.resume()
+        self.assertTrue(all(self.system.states.values()))
+        self.assertTrue(self.system.fenced and recovery.ROLLOUT_LOCK.exists())
+
+    def test_commit_persistence_failure_holds_all_roles_before_teardown(self):
+        self.prepare()
+        self.freeze()
+        self.restore()
+        persist = self.flow.persist
+        def write(job):
+            if job['phase'] == 'resume-committed':
+                raise OSError('ENOSPC')
+            persist(job)
+        self.flow.persist = write
+        with self.assertRaises(OSError):
+            self.resume()
+        self.assertTrue(all(self.system.states.values()))
+        self.assertTrue(self.system.fenced and recovery.ROLLOUT_LOCK.exists())
+        self.assertEqual(self.call('status')['phase'], 'held')
+
+    def test_durable_resume_commit_precedes_fence_lock_and_final_journal_failures(self):
+        for failure in ['fence', 'lock', 'journal']:
+            with self.subTest(failure=failure):
+                self.tearDown()
+                self.setUp()
+                self.prepare()
+                self.freeze()
+                self.restore()
+                def fail(*args):
+                    raise OSError('Injected I/O failure')
+                if failure == 'fence':
+                    self.system.fence = fail
+                elif failure == 'lock':
+                    self.flow.release = fail
+                else:
+                    persist = self.flow.persist
+                    def write(job):
+                        if job['phase'] == 'resumed':
+                            fail()
+                        persist(job)
+                    self.flow.persist = write
+                with self.assertRaises(OSError):
+                    self.resume()
+                self.assertEqual(self.call('status')['phase'], 'resume-committed')
+                self.assertFalse(any(self.system.states.values()))
 
     def test_unknown_and_production_requests_have_no_effects(self):
         for extra in [{'environment': 'production'}, {'command': 'shell'}, {'action': 'run-command'}, {'jobId': '../other'}, {'actor': []}]:

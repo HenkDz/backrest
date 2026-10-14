@@ -48,9 +48,13 @@ export function recoveryAction(job: RecoveryJob | null | undefined) {
       };
     case "restored":
     case "rolled-back":
+    case "resume-committed":
       return {
         action: "resume",
-        label: "Resume staging",
+        label:
+          job.phase === "resume-committed"
+            ? "Finish resume cleanup"
+            : "Resume staging",
         phrase: `RESUME DZDISTRO STAGING ${job.id.slice(0, 8)}`,
       };
     case "resumed":
@@ -86,6 +90,8 @@ const descriptions: Record<string, string> = {
     "The selected snapshot is now the staging database. The previous database is retained for rollback. Staging stays behind maintenance until you resume it.",
   resuming:
     "Staging is resuming. Maintenance stays active until the checks finish.",
+  "resume-committed":
+    "All staging writers passed the resume checks and their resumed state is durably committed. Maintenance and lock cleanup still need to finish. This step does not repeat the database switch.",
   resumed:
     "Staging has resumed. The previous database remains available for a controlled rollback.",
   "frozen-rollback":

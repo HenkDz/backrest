@@ -7,6 +7,7 @@ import json
 import os
 from pathlib import Path
 import re
+import select
 import subprocess
 import sys
 import time
@@ -70,7 +71,10 @@ def identifier(value):
 
 def process_identity(pid):
     try:
-        start = Path('/proc/' + str(pid) + '/stat').read_text().rsplit(')', 1)[1].split()[19]
+        fields = Path('/proc/' + str(pid) + '/stat').read_text().rsplit(')', 1)[1].split()
+        if fields[0] == 'Z':
+            return None
+        start = fields[19]
         return {'pid': pid, 'start': start, 'boot': Path('/proc/sys/kernel/random/boot_id').read_text().strip()}
     except OSError:
         return None
@@ -78,6 +82,27 @@ def process_identity(pid):
 
 def worker_hash():
     return hashlib.sha256(Path(__file__).read_bytes()).hexdigest()
+
+
+def ssh_sessions():
+    result = []
+    pid = os.getpid()
+    if not os.environ.get('SSH_CONNECTION'):
+        return result
+    while pid > 1:
+        stat = Path('/proc/' + str(pid) + '/stat').read_text()
+        name, tail = stat.rsplit(')', 1)
+        if name.split('(', 1)[1].startswith('sshd'):
+            identity = process_identity(pid)
+            require(identity is not None, 'SSH session ended before resume.')
+            result.append(identity)
+        pid = int(tail.split()[1])
+    require(result, 'Cannot verify the SSH recovery session.')
+    return result
+
+
+def sessions_alive(job):
+    return all(process_identity(item['pid']) == item for item in job.get('sessions', []))
 
 
 def load_config(path):
@@ -120,7 +145,7 @@ class System:
                 with (directory / 'worker-errors.log').open('ab') as log:
                     os.chmod(log.name, 0o600)
                     log.write(result.stderr[-65536:] + b'\n')
-        require(result.returncode == 0, 'Server operation failed; staging remains held. Inspect the restricted worker logs.')
+        require(result.returncode == 0, 'Server operation failed; refresh recovery status and inspect the restricted worker logs.')
         return result.stdout
 
     def target(self):
@@ -182,12 +207,19 @@ class System:
             job['dumpSha256'] = hashlib.file_digest(dump, 'sha256').hexdigest()
         job['dumpBytes'] = dump_path.stat().st_size
         require(self.oid(job['candidateDatabase']) is None, 'Candidate database already exists.')
-        self.sql('CREATE DATABASE ' + identifier(job['candidateDatabase']) + ' TEMPLATE template0 OWNER ' + identifier(DATABASE))
+        role = 'dzdistro_recovery_' + job['id']
+        require(self.sql("SELECT rolsuper FROM pg_roles WHERE rolname='" + DATABASE + "'") == 't', 'The pinned staging application role must retain access to recovered objects.')
+        require(self.sql("SELECT count(*) FROM pg_roles WHERE rolname='" + role + "'") == '0', 'Recovery role already exists.')
+        self.sql('CREATE ROLE ' + identifier(role) + ' LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOINHERIT NOREPLICATION NOBYPASSRLS PASSWORD NULL')
+        job['candidateRole'] = role
+        persist(job)
+        self.sql('CREATE DATABASE ' + identifier(job['candidateDatabase']) + ' TEMPLATE template0 OWNER ' + identifier(role))
         job['candidateOID'] = self.oid(job['candidateDatabase'])
         persist(job)
         with dump_path.open('rb') as dump:
-            result = subprocess.run(['docker', 'exec', '-i', self.target_id, 'pg_restore', '--exit-on-error', '--single-transaction', '--no-owner', '--no-acl', '-U', DATABASE, '-d', job['candidateDatabase']], stdin=dump, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1200)
+            result = subprocess.run(['docker', 'exec', '-i', self.target_id, 'pg_restore', '--exit-on-error', '--single-transaction', '--no-owner', '--no-acl', '-U', role, '-d', job['candidateDatabase']], stdin=dump, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=1200)
         require(result.returncode == 0, 'Isolated PostgreSQL restore failed. Current staging was not replaced.')
+        self.sql('ALTER ROLE ' + identifier(role) + ' NOLOGIN')
         job['validation'] = self.validate(job['candidateDatabase'])
         current = self.validate(DATABASE)
         require(current['schemaHash'] == job['validation']['schemaHash'], 'Snapshot schema is incompatible with the current staging application.')
@@ -256,12 +288,39 @@ class System:
         self.run(['docker', 'pause' if paused else 'unpause', container])
 
     def hold_writers(self, job):
-        expected = {item['id']: item for item in job['writers']}
-        for item in self.writers():
-            saved = expected.get(item['id'])
-            require(saved is not None and item['image'] == saved['image'] and item['configHash'] == saved['configHash'], 'Cannot re-pause a changed staging writer.')
-            if not item['paused']:
-                self.pause(item['id'], True)
+        failures = []
+        for saved in job['writers']:
+            try:
+                item = json.loads(self.run(['docker', 'inspect', saved['id']]))[0]
+                labels = item['Config']['Labels'] or {}
+                require(item['Id'] == saved['id'] and item['Image'] == saved['image'] and item['State']['Running'], 'Cannot re-pause a changed staging writer.')
+                require(all(labels.get(k) == v for k, v in {'coolify.projectName': 'dzdistro', 'coolify.environmentName': 'staging', 'coolify.type': 'application', 'coolify.applicationUuid': self.config['writers'][saved['role']], 'coolify.resourceName': 'dzdistro-staging-image-' + saved['role'], 'coolify.pullRequestId': '0'}.items()), 'Cannot re-pause an unverified writer.')
+                require(hashlib.sha256(json.dumps(item['Config'].get('Env', []), sort_keys=True).encode()).hexdigest() == saved['configHash'], 'Cannot re-pause changed writer configuration.')
+                if not item['State']['Paused']:
+                    self.pause(item['Id'], True)
+            except Exception:
+                failures.append(saved['role'])
+        require(not failures, 'Writer containment could not verify every recorded role; inspect staging immediately.')
+
+    def start_guard(self, job):
+        reader, writer = os.pipe()
+        try:
+            process = subprocess.Popen([sys.executable, str(Path(__file__).resolve()), '--guard-resume', job['id'], '--ready-fd', str(writer)],
+                                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                       pass_fds=(writer,), start_new_session=True)
+            os.close(writer)
+            writer = None
+            require(select.select([reader], [], [], 15)[0] and os.read(reader, 16) == b'ready\n', 'Independent resume guard did not start.')
+            identity = process_identity(process.pid)
+            require(identity is not None, 'Independent resume guard exited.')
+            return identity
+        finally:
+            os.close(reader)
+            if writer is not None:
+                os.close(writer)
+
+    def check_guard(self, job):
+        require(sessions_alive(job) and process_identity(job['guard']['pid']) == job['guard'], 'Independent resume guard or SSH session is unavailable.')
 
     def probe_web(self, job):
         web = next(item for item in job['writers'] if item['role'] == 'web')
@@ -365,6 +424,9 @@ class Workflow:
                 if job.get('candidateOID') and self.system.oid(job['candidateDatabase']) == job['candidateOID']:
                     self.system.sql('DROP DATABASE ' + identifier(job['candidateDatabase']) + ' WITH (FORCE)')
                     job['candidateOID'] = None
+                if job.get('candidateRole'):
+                    self.system.sql('DROP ROLE ' + identifier(job['candidateRole']))
+                    job['candidateRole'] = None
                 self.persist(job)
                 raise
             finally:
@@ -432,7 +494,11 @@ class Workflow:
                 raise
         elif action == 'resume':
             require(request.get('queuesReconciled') is True, 'Confirm queue and cache reconciliation before resuming staging.')
-            require(job['phase'] in {'restored', 'rolled-back'}, 'Only a verified switched database may resume.')
+            require(job['phase'] in {'restored', 'rolled-back', 'resume-committed'}, 'Only a verified switched database may resume.')
+            if job['phase'] == 'resume-committed':
+                self.finish_resume(job)
+                self.audit(request, job['phase'])
+                return job
             self.owned_lock(job)
             expected_oid = job['originalOID'] if job.get('rolledBack') else job['candidateOID']
             require(self.system.oid(DATABASE) == expected_oid, 'Active database identity changed.')
@@ -441,23 +507,33 @@ class Workflow:
             self.system.probe_fence(job)
             self.audit(request, 'intent-after-operator-queue-cache-checks')
             job['phase'] = 'resuming'
+            job['sessions'] = ssh_sessions()
             self.persist(job)
+            committed = False
             try:
+                job['guard'] = self.system.start_guard(job)
+                self.persist(job)
                 web = next(item for item in job['writers'] if item['role'] == 'web')
+                self.system.check_guard(job)
                 self.system.pause(web['id'], False)
                 self.system.probe_web(job)
                 for item in job['writers']:
                     if item['role'] != 'web':
+                        self.system.check_guard(job)
                         self.system.pause(item['id'], False)
                 self.system.verify_writers(job, False)
-                self.system.fence(job, False)
-                self.release(job)
-                job['phase'] = 'resumed'
+                self.system.check_guard(job)
+                job['phase'] = 'resume-committed'
                 self.persist(job)
+                committed = True
+                self.finish_resume(job)
             except Exception:
-                job['phase'] = 'held'
-                self.persist(job)
-                self.system.hold_writers(job)
+                if not committed:
+                    try:
+                        self.system.hold_writers(job)
+                    finally:
+                        job['phase'] = 'held'
+                        self.persist(job)
                 raise
         elif action == 'abort':
             require(job['phase'] in {'validated', 'failed'}, 'A paused or switched recovery cannot be discarded.')
@@ -467,10 +543,52 @@ class Workflow:
             if candidate:
                 require(self.system.oid(job['candidateDatabase']) == candidate, 'Candidate database identity changed.')
                 self.system.sql('DROP DATABASE ' + identifier(job['candidateDatabase']) + ' WITH (FORCE)')
+                if job.get('candidateRole'):
+                    self.system.sql('DROP ROLE ' + identifier(job['candidateRole']))
             job['phase'] = 'aborted'
             self.persist(job)
         self.audit(request, job['phase'])
         return job
+
+    def finish_resume(self, job):
+        expected = job['originalOID'] if job.get('rolledBack') else job['candidateOID']
+        require(self.system.oid(DATABASE) == expected, 'Committed database identity changed.')
+        self.system.verify_writers(job, False)
+        self.system.probe_web(job)
+        if ROLLOUT_LOCK.exists():
+            self.owned_lock(job)
+        path = Path(self.config['proxyConfig'])
+        if path.exists():
+            require(ROLLOUT_LOCK.exists(), 'Cannot remove a fence without its owned lock.')
+            self.system.fence(job, False)
+        if ROLLOUT_LOCK.exists():
+            self.release(job)
+        job['phase'] = 'resumed'
+        self.persist(job)
+
+    def guard_resume(self, job_id, ready_fd):
+        job = read_json(self.path(job_id))
+        require(job['phase'] == 'resuming' and job.get('workerHash') == worker_hash(), 'Resume guard identity changed.')
+        require(job['configHash'] == hashlib.sha256(json.dumps(self.config, sort_keys=True).encode()).hexdigest(), 'Resume guard configuration changed.')
+        self.check_target(job)
+        self.owned_lock(job)
+        self.system.verify_writers(job, True)
+        self.system.probe_fence(job)
+        os.write(ready_fd, b'ready\n')
+        os.close(ready_fd)
+        while True:
+            current = read_json(self.path(job_id))
+            if current['phase'] != 'resuming':
+                return
+            identity = job['process']
+            if process_identity(identity['pid']) != identity or not sessions_alive(job):
+                self.owned_lock(job)
+                self.system.hold_writers(job)
+                current['phase'] = 'held'
+                current['interrupted'] = True
+                self.persist(current)
+                return
+            time.sleep(0.25)
 
 
 class Fence(http.server.BaseHTTPRequestHandler):
@@ -503,6 +621,8 @@ class Fence(http.server.BaseHTTPRequestHandler):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--serve-fence', action='store_true')
+    parser.add_argument('--guard-resume')
+    parser.add_argument('--ready-fd', type=int)
     args = parser.parse_args()
     if args.serve_fence:
         http.server.ThreadingHTTPServer(('0.0.0.0', 8790), Fence).serve_forever()
@@ -511,6 +631,9 @@ def main():
     try:
         require(os.environ.get('SSH_ORIGINAL_COMMAND', 'nhws-staging-recovery') == 'nhws-staging-recovery', 'Unsupported SSH command.')
         config = load_config(CONFIG_PATH)
+        if args.guard_resume:
+            Workflow(config, System(config)).guard_resume(args.guard_resume, args.ready_fd)
+            return
         raw = sys.stdin.buffer.read(16385)
         require(len(raw) <= 16384, 'Recovery request is too large.')
         request = json.loads(raw, object_pairs_hook=no_duplicates)
@@ -526,7 +649,7 @@ def main():
     except Refusal as error:
         result['error'] = str(error)
     except Exception:
-        result['error'] = 'Recovery stopped with an uncertain outcome. Keep staging held and inspect the restricted worker journal.'
+        result['error'] = 'Recovery stopped. Refresh its status and inspect the restricted worker journal before advancing.'
     print(json.dumps(result))
     raise SystemExit(1 if result.get('error') else 0)
 
