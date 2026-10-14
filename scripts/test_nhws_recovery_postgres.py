@@ -1,0 +1,97 @@
+"""Real PostgreSQL/restic rehearsal; fence/writer control is covered separately."""
+import hashlib
+import importlib.util
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+spec = importlib.util.spec_from_file_location('recovery', Path(__file__).with_name('nhws_staging_recovery.py'))
+recovery = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(recovery)
+
+container = sys.argv[1]
+assert container.startswith('nhws-recovery-test-')
+inspection = json.loads(subprocess.check_output(['docker', 'inspect', container]))[0]
+assert inspection['Config']['Labels'].get('nhws.recovery-fixture') == 'true'
+
+
+class PostgreSQLRehearsal(recovery.System):
+    def writers(self):
+        return [{'id': role, 'role': role, 'image': 'synthetic-image', 'configHash': 'synthetic-config', 'paused': self.paused} for role in ['web', 'queue', 'scheduler', 'pulse', 'release']]
+
+    def fence(self, job, enable):
+        self.fenced = enable
+        job['fenceHash'] = 'synthetic-fence'
+
+    def probe_fence(self, job):
+        assert self.fenced
+
+    def verify_writers(self, job, paused):
+        assert self.paused == paused
+
+    def pause(self, container, paused):
+        self.paused = paused
+
+    def probe_web(self, job):
+        assert self.sql('SELECT count(*) FROM documents', recovery.DATABASE) in {'1', '2'}
+
+
+with tempfile.TemporaryDirectory(prefix='nhws-pg-rehearsal-') as temporary:
+    root = Path(temporary)
+    password = root / 'password'
+    password.write_text('synthetic-repository-password-only')
+    password.chmod(0o600)
+    env = os.environ | {'RESTIC_PASSWORD_FILE': str(password)}
+    repo = root / 'repository'
+    command = ['/usr/local/bin/restic', '-r', str(repo)]
+    subprocess.run(command + ['init'], env=env, check=True, stdout=subprocess.DEVNULL)
+    repository_id = json.loads(subprocess.check_output(command + ['cat', 'config'], env=env))['id']
+    config = {'container': container, 'repository': str(repo), 'repositoryId': repository_id,
+              'passwordFile': str(password), 'stateDir': str(root / 'state'), 'environment': 'staging'}
+    system = PostgreSQLRehearsal(config)
+    system.paused, system.fenced = False, False
+    system.sql('''CREATE TABLE migrations(id serial PRIMARY KEY, migration text NOT NULL, batch int NOT NULL);
+CREATE TABLE users(id serial PRIMARY KEY, name text NOT NULL);
+CREATE TABLE businesses(id serial PRIMARY KEY, user_id int NOT NULL REFERENCES users(id));
+CREATE TABLE documents(id serial PRIMARY KEY, business_id int NOT NULL REFERENCES businesses(id), amount numeric(12,2) NOT NULL CHECK(amount>=0));
+INSERT INTO migrations(migration,batch) VALUES('synthetic_initial_schema',1);
+INSERT INTO users(name) VALUES('Synthetic operator');
+INSERT INTO businesses(user_id) VALUES(1);
+INSERT INTO documents(business_id,amount) VALUES(1,100.00);''', recovery.DATABASE)
+    dump = subprocess.check_output(['docker', 'exec', system.target_id, 'pg_dump', '-U', recovery.DATABASE, '-d', recovery.DATABASE, '-Fc', '--no-owner', '--no-acl'])
+    subprocess.run(command + ['backup', '--stdin', '--stdin-filename', 'dzdistro_staging.dump', '--tag', 'staging-postgres'], input=dump, env=env, check=True, stdout=subprocess.DEVNULL)
+    snapshot = json.loads(subprocess.check_output(command + ['snapshots', '--json'], env=env))[0]['id']
+    system.sql('INSERT INTO documents(business_id,amount) VALUES(1,200.00)', recovery.DATABASE)
+    assert system.sql('SELECT count(*) FROM documents', recovery.DATABASE) == '2'
+    recovery.ROLLOUT_LOCK = root / 'shared-staging-rollout.lock'
+    flow = recovery.Workflow(config, system)
+    job_id = 'c' * 32
+
+    def call(action, confirmation='', **extra):
+        return flow.handle({'action': action, 'jobId': job_id, 'environment': 'staging', 'actor': 'synthetic-operator', 'confirmation': confirmation} | extra)
+
+    job = call('prepare', snapshotId=snapshot)
+    assert job['phase'] == 'validated' and job['validation']['tables'] == 4 and job['validation']['rows'] == 4
+    assert job['dumpSha256'] == hashlib.sha256(dump).hexdigest()
+    assert not list((root / 'state').glob('*.dump'))
+    assert system.sql('SELECT count(*) FROM documents', recovery.DATABASE) == '2'
+    call('freeze', 'PAUSE DZDISTRO STAGING')
+    call('restore', 'RESTORE DZDISTRO STAGING ' + snapshot[:8])
+    assert system.sql('SELECT count(*) FROM documents', recovery.DATABASE) == '1'
+    assert system.sql('SELECT sum(amount) FROM documents', recovery.DATABASE) == '100.00'
+    assert system.oid(job['retainedDatabase']) == job['originalOID']
+    call('resume', 'RESUME DZDISTRO STAGING ' + job_id[:8], queuesReconciled=True)
+    call('freeze-rollback', 'PAUSE DZDISTRO STAGING')
+    call('rollback', 'ROLLBACK DZDISTRO STAGING ' + job_id[:8])
+    assert system.sql('SELECT count(*) FROM documents', recovery.DATABASE) == '2'
+    assert system.sql('SELECT sum(amount) FROM documents', recovery.DATABASE) == '300.00'
+    assert system.oid(job['afterDatabase']) == job['candidateOID']
+    call('resume', 'RESUME DZDISTRO STAGING ' + job_id[:8], queuesReconciled=True)
+    print(json.dumps({'real_postgresql_restore': 'PASS', 'native_restic_encryption_and_decryption': 'PASS',
+                      'archive_sha256_matches': True, 'snapshot_documents': 1, 'restored_total': '100.00',
+                      'rollback_documents': 2, 'rollback_total': '300.00', 'original_database_retained': True,
+                      'post_restore_database_retained_after_rollback': True, 'plaintext_dump_removed': True,
+                      'scope': 'synthetic local PostgreSQL17; fence/writer adapter in this test is simulated'}))

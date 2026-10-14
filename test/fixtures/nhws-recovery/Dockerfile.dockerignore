@@ -1,0 +1,7 @@
+**
+!scripts/
+!scripts/nhws_staging_recovery.py
+!test/
+!test/fixtures/
+!test/fixtures/nhws-recovery/
+!test/fixtures/nhws-recovery/Dockerfile

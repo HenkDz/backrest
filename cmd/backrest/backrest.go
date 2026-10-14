@@ -247,6 +247,7 @@ func newServer(
 
 	// Routing
 	rootMux := newRootMux(apiBackrestHandler, apiAuthenticationHandler, syncHandler, syncStateHandler, downloadHandler, authenticator)
+	rootMux.Handle("/api/database-restore", auth.RequireAuthentication(api.NewDatabaseRestoreHandler(orch), authenticator))
 
 	var handler http.Handler = rootMux
 	if version == "unknown" { // dev build, enable CORS for local development

@@ -14,4 +14,5 @@ cmd/backrest/backrest
 package-lock.json
 .gemini
 .claude
+__pycache__/
 webui/dist-backup/
