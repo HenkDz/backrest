@@ -192,3 +192,29 @@ func TestDatabaseRecoveryCatalogCacheCoalescesAndFailsClosed(t *testing.T) {
 		t.Fatal("cancelled request enumerated repository")
 	}
 }
+
+func TestDatabaseRecoveryCatalogWaitCancellation(t *testing.T) {
+	h := &databaseRestoreHandler{}
+	loading, release, completed := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(completed)
+		_, _ = h.cachedSnapshots(context.Background(), "guid", false, func() ([]recoverySnapshot, error) { close(loading); <-release; return []recoverySnapshot{}, nil })
+	}()
+	<-loading
+	defer func() { close(release); <-completed }()
+	ctx, cancel := context.WithCancel(context.Background())
+	waiting := make(chan error, 1)
+	go func() {
+		_, err := h.cachedSnapshots(ctx, "guid", false, func() ([]recoverySnapshot, error) { return nil, errors.New("waiter unexpectedly loaded") })
+		waiting <- err
+	}()
+	cancel()
+	select {
+	case err := <-waiting:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("wrong cancellation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("cancelled waiter stayed behind the slow loader")
+	}
+}

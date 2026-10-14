@@ -66,7 +66,8 @@ type databaseRestoreHandler struct {
 	run            func(context.Context, DatabaseRestoreConfig, recoveryRequest) (recoveryReply, error)
 	listSnapshots  func(context.Context, DatabaseRestoreConfig, bool) ([]recoverySnapshot, error)
 	mu             sync.Mutex
-	snapshotMu     sync.Mutex
+	snapshotOnce   sync.Once
+	snapshotGate   chan struct{}
 	snapshotGUID   string
 	snapshotLoaded time.Time
 	snapshotCache  []recoverySnapshot
@@ -120,8 +121,13 @@ func (h *databaseRestoreHandler) snapshots(ctx context.Context, cfg DatabaseRest
 }
 
 func (h *databaseRestoreHandler) cachedSnapshots(ctx context.Context, guid string, fresh bool, load func() ([]recoverySnapshot, error)) ([]recoverySnapshot, error) {
-	h.snapshotMu.Lock()
-	defer h.snapshotMu.Unlock()
+	h.snapshotOnce.Do(func() { h.snapshotGate = make(chan struct{}, 1) })
+	select {
+	case h.snapshotGate <- struct{}{}:
+		defer func() { <-h.snapshotGate }()
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
