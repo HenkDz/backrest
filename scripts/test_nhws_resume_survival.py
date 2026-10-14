@@ -38,6 +38,8 @@ shim = Path('/usr/local/bin/docker')
 assert str(shim) != real_docker and not shim.exists()
 barrier = Path('/run/nhws-recovery-fixture-barrier.json')
 marker = Path('/run/nhws-recovery-fixture-marker.json')
+effect = Path('/run/nhws-recovery-fixture-effect')
+fault = Path('/run/nhws-recovery-fixture-fault')
 shim.write_text('''#!/usr/bin/python3
 import json,sys,subprocess,time,os
 from pathlib import Path
@@ -50,9 +52,17 @@ def block(c):
     return
    time.sleep(.05)
 c=json.loads(p.read_text()) if p.exists() else {}
+if len(sys.argv)==3 and sys.argv[2]==c.get('container') and sys.argv[1]==c.get('fault'):
+ try:
+  descriptor=os.open('/run/nhws-recovery-fixture-fault',os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600)
+  os.close(descriptor)
+  sys.stderr.write('Injected one-shot Docker containment failure')
+  sys.exit(1)
+ except FileExistsError: pass
 matched=len(sys.argv)==3 and sys.argv[1]=='unpause' and sys.argv[2]==c.get('container')
 if matched and c['when']=='before': block(c)
 code=subprocess.run([REAL_DOCKER,*sys.argv[1:]]).returncode
+if matched and code==0: Path('/run/nhws-recovery-fixture-effect').touch()
 if matched and c['when']=='after': block(c)
 if matched and json.loads(p.read_text()).get('fail'):
  sys.stderr.write('Injected synthetic unpause failure')
@@ -78,6 +88,7 @@ def wait_for(predicate, seconds=20):
 try:
     cases = [(mode, role, when) for mode in ['hard-kill', 'SSH-disconnect'] for role in ['web', 'queue', 'scheduler', 'pulse', 'release'] for when in ['before', 'after']]
     cases.append(('journal-write-failure', 'queue', 'after'))
+    cases.extend((mode, 'queue', 'after') for mode in ['transient-inspect', 'transient-pause', 'late-effect'])
     for mode, role, when in cases:
         job = recovery.read_json(flow.path(job_id))
         previous_guard = job.get('guard')
@@ -87,7 +98,13 @@ try:
         if previous_guard:
             wait_for(lambda: recovery.process_identity(previous_guard['pid']) != previous_guard)
         system.verify_writers(job, True)
-        barrier.write_text(json.dumps({'container': next(item['id'] for item in job['writers'] if item['role'] == role), 'when': when}))
+        selected = next(item['id'] for item in job['writers'] if item['role'] == role)
+        settings = {'container': selected, 'when': when}
+        if mode.startswith('transient-'):
+            settings['fault'] = mode.removeprefix('transient-')
+        barrier.write_text(json.dumps(settings))
+        effect.unlink(missing_ok=True)
+        fault.unlink(missing_ok=True)
         if marker.exists():
             marker.unlink()
         client = subprocess.Popen(['ssh', '-i', str(key), '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=yes', '-o', 'UserKnownHostsFile=' + str(known_hosts), 'root@localhost', 'nhws-staging-recovery'], stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -100,17 +117,24 @@ try:
         assert recovery.process_identity(pending['guard']['pid']) == pending['guard']
         blocked_pid = json.loads(marker.read_text())['pid']
         failed_journal = flow.path(job_id).with_suffix('.pending')
-        if mode == 'hard-kill':
+        if mode in {'hard-kill', 'transient-inspect', 'transient-pause', 'late-effect'}:
             os.kill(pending['process']['pid'], signal.SIGKILL)
         elif mode == 'SSH-disconnect':
             client.kill()
-        else:
+        elif mode == 'journal-write-failure':
             failed_journal.symlink_to('/dev/full')
         settings = json.loads(barrier.read_text())
         settings['release'] = True
         settings['fail'] = mode == 'journal-write-failure'
         barrier.write_text(json.dumps(settings))
+        wait_for(effect.exists)
         wait_for(lambda: all(item['paused'] for item in system.writers()))
+        if mode.startswith('transient-'):
+            assert fault.exists()
+        if mode == 'late-effect':
+            wait_for(lambda: call('status')['phase'] == 'held')
+            subprocess.run([real_docker, 'unpause', selected], check=True, stdout=subprocess.DEVNULL)
+            wait_for(lambda: all(item['paused'] for item in system.writers()))
         assert flow.owned_lock(job) is None and Path(config['proxyConfig']).exists()
         assert system.oid(recovery.DATABASE) == active_oid
         if mode != 'journal-write-failure':
@@ -123,7 +147,7 @@ try:
             assert os.readlink(failed_journal) == '/dev/full'
             failed_journal.unlink()
         wait_for(lambda: call('status')['phase'] == 'held')
-        receipts.append({'mode': mode, 'role': role, 'barrier': when, 'allFiveRolesPaused': True, 'activeOIDUnchanged': True, 'fenceAndLockRetained': True})
+        receipts.append({'mode': mode, 'role': role, 'barrier': when, 'delayedEffectCompleted': True, 'allFiveRolesPaused': True, 'activeOIDUnchanged': True, 'fenceAndLockRetained': True})
         print(json.dumps(receipts[-1]), flush=True)
         if client.poll() is None:
             client.kill()
@@ -136,6 +160,8 @@ try:
     wait_for(lambda: recovery.process_identity(previous_guard['pid']) != previous_guard)
     barrier.unlink()
     marker.unlink(missing_ok=True)
+    effect.unlink(missing_ok=True)
+    fault.unlink(missing_ok=True)
     child_code = '''import importlib.util,json,subprocess,sys,time
 from pathlib import Path
 spec=importlib.util.spec_from_file_location('r','/usr/local/libexec/nhweb-backups/staging_recovery.py')

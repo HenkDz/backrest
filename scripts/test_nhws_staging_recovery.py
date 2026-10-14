@@ -308,6 +308,37 @@ class RecoveryTests(unittest.TestCase):
         self.assertEqual(recovery.read_json(recovery.ROLLOUT_LOCK / 'owner.json'), foreign)
         self.assertEqual([event for event in self.system.events if event.startswith('unpause-') or event == 'switch'], before)
 
+    def test_older_rollback_cannot_strand_a_newer_validated_job(self):
+        self.prepare()
+        self.freeze()
+        self.restore()
+        self.resume()
+        newer = 'f' * 32
+        self.flow.handle({'action': 'prepare', 'jobId': newer, 'snapshotId': SNAPSHOT, 'actor': 'other-operator', 'environment': 'staging'})
+        before = self.system.events.copy()
+        with self.assertRaises(recovery.Refusal):
+            self.call('freeze-rollback', 'PAUSE DZDISTRO STAGING')
+        self.assertEqual(self.system.events, before)
+        self.assertEqual(self.flow.handle({'action': 'status', 'jobId': newer, 'actor': 'other-operator', 'environment': 'staging'})['phase'], 'validated')
+        self.flow.handle({'action': 'abort', 'jobId': newer, 'confirmation': 'DISCARD TEST RESTORE ' + newer[:8], 'actor': 'other-operator', 'environment': 'staging'})
+        self.assertEqual(self.flow.handle({'action': 'status', 'jobId': newer, 'actor': 'other-operator', 'environment': 'staging'})['phase'], 'aborted')
+
+    def test_transient_containment_failure_retains_pending_state_then_retries(self):
+        job = self.prepare()
+        self.freeze()
+        self.restore()
+        job = self.call('status')
+        job['phase'] = 'resuming'
+        hold = self.system.hold_writers
+        self.system.hold_writers = lambda _: (_ for _ in ()).throw(recovery.Refusal('One-shot Docker error'))
+        self.flow.contain(job)
+        self.assertEqual(job['phase'], 'containing')
+        self.assertTrue(recovery.ROLLOUT_LOCK.exists() and self.system.fenced)
+        self.system.hold_writers = hold
+        self.flow.contain(job)
+        self.assertEqual(job['phase'], 'held')
+        self.assertTrue(all(self.system.states.values()))
+
     def test_unknown_and_production_requests_have_no_effects(self):
         for extra in [{'environment': 'production'}, {'command': 'shell'}, {'action': 'run-command'}, {'jobId': '../other'}, {'actor': []}]:
             with self.assertRaises(recovery.Refusal):

@@ -187,6 +187,17 @@ class System:
         schema += '\n' + sql("SELECT conrelid::regclass::text||':'||contype::text||':'||pg_get_constraintdef(oid) FROM pg_catalog.pg_constraint WHERE connamespace='public'::regnamespace ORDER BY conrelid::regclass::text,conname")
         schema += '\n' + sql("SELECT migration FROM public.migrations ORDER BY migration")
         schema += '\n' + sql("SELECT indexdef FROM pg_catalog.pg_indexes WHERE schemaname='public' ORDER BY tablename,indexname")
+        schema += '\n' + sql("SELECT n.nspname||':'||p.proname||':'||pg_get_functiondef(p.oid) FROM pg_catalog.pg_proc p JOIN pg_catalog.pg_namespace n ON n.oid=p.pronamespace WHERE n.nspname NOT LIKE 'pg_%' AND n.nspname<>'information_schema' AND p.prokind IN ('f','p') ORDER BY n.nspname,p.proname,pg_get_function_identity_arguments(p.oid)")
+        schema += '\n' + sql("SELECT n.nspname||':'||c.relname||':'||pg_get_triggerdef(t.oid) FROM pg_catalog.pg_trigger t JOIN pg_catalog.pg_class c ON c.oid=t.tgrelid JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE NOT t.tgisinternal AND n.nspname NOT LIKE 'pg_%' ORDER BY n.nspname,c.relname,t.tgname")
+        schema += '\n' + sql("SELECT schemaname||':'||viewname||':'||definition FROM pg_catalog.pg_views WHERE schemaname NOT LIKE 'pg_%' AND schemaname<>'information_schema' ORDER BY schemaname,viewname")
+        schema += '\n' + sql("SELECT schemaname||':'||tablename||':'||rulename||':'||definition FROM pg_catalog.pg_rules WHERE schemaname NOT LIKE 'pg_%' ORDER BY schemaname,tablename,rulename")
+        schema += '\n' + sql("SELECT schemaname||':'||tablename||':'||policyname||':'||cmd||':'||roles::text||':'||coalesce(qual,'')||':'||coalesce(with_check,'') FROM pg_catalog.pg_policies WHERE schemaname NOT LIKE 'pg_%' ORDER BY schemaname,tablename,policyname")
+        schema += '\n' + sql("SELECT n.nspname||':'||c.relname||':'||c.relrowsecurity||':'||c.relforcerowsecurity FROM pg_catalog.pg_class c JOIN pg_catalog.pg_namespace n ON n.oid=c.relnamespace WHERE n.nspname NOT LIKE 'pg_%' AND n.nspname<>'information_schema' ORDER BY n.nspname,c.relname")
+        dump = self.run(['docker', 'exec', '-e', 'PGOPTIONS=-c search_path=pg_catalog', self.target_id, 'pg_dump', '--schema-only', '--no-owner', '--no-acl', '--no-comments', '-U', role, '-d', database]).decode()
+        # pg_dump's random psql restriction token and ownership headers are transport metadata.
+        canonical = '\n'.join(line for line in dump.splitlines() if not line.startswith(('\\restrict ', '\\unrestrict ', '--')))
+        schema += '\n' + canonical
+        schema += '\n' + sql("SELECT s.setconfig::text FROM pg_catalog.pg_db_role_setting s JOIN pg_catalog.pg_database d ON d.oid=s.setdatabase WHERE d.datname='" + database + "' AND s.setrole=0 ORDER BY s.setconfig::text")
         counts = {table: int(sql('SELECT count(*) FROM public.' + '"' + table.replace('"', '""') + '"')) for table in tables}
         return {'schemaHash': hashlib.sha256(schema.encode()).hexdigest(), 'tables': len(tables), 'rows': sum(counts.values()), 'tableRows': counts}
 
@@ -392,6 +403,11 @@ class Workflow:
         require(not path.is_symlink() and read_json(path / 'owner.json') == {'schema_version': 1, 'environment': 'staging', 'rollout_id': job['lockOwner']}, 'Release receipt belongs to another operation.')
         return True
 
+    def no_other_open_job(self, job_id):
+        for other in self.directory.glob('[0-9a-f]' * 32 + '.json'):
+            if other != self.path(job_id):
+                require(read_json(other)['phase'] in {'resumed', 'aborted', 'failed'}, 'Finish the existing recovery job first.')
+
     def persist(self, job):
         if job['phase'] in {'preparing', 'freezing', 'switching', 'resuming'}:
             job['process'] = process_identity(os.getpid())
@@ -450,8 +466,7 @@ class Workflow:
         require(not path.is_symlink(), 'Recovery journal is not a regular file.')
         if action == 'prepare':
             require(not path.exists() and SNAPSHOT_ID.fullmatch(request.get('snapshotId', '')) is not None, 'Select a new staging snapshot job.')
-            for other in self.directory.glob('[0-9a-f]' * 32 + '.json'):
-                require(read_json(other)['phase'] in {'resumed', 'aborted', 'failed'}, 'Finish the existing recovery job first.')
+            self.no_other_open_job(job_id)
             job = {'id': job_id, 'snapshotId': request['snapshotId'], 'phase': 'preparing', 'actor': request['actor'],
                    'candidateDatabase': 'dzdistro_restore_' + job_id, 'retainedDatabase': 'dzdistro_before_' + job_id,
                    'afterDatabase': 'dzdistro_after_' + job_id, 'originalOID': self.system.oid(DATABASE),
@@ -493,6 +508,7 @@ class Workflow:
                   'resume': 'RESUME DZDISTRO STAGING ' + job_id[:8], 'abort': 'DISCARD TEST RESTORE ' + job_id[:8]}[action]
         require(request.get('confirmation') == phrase, 'Typed confirmation does not match this staging operation.')
         if action in {'freeze', 'freeze-rollback'}:
+            self.no_other_open_job(job_id)
             expected_phase = 'validated' if action == 'freeze' else 'resumed'
             require(job['phase'] == expected_phase and not (action == 'freeze-rollback' and job.get('rolledBack')), 'Job is not eligible for this pause.')
             expected_oid = job['originalOID'] if action == 'freeze' else job['candidateOID']
@@ -641,19 +657,11 @@ class Workflow:
                 while True:
                     with self.transition(job):
                         current = read_json(self.path(job_id))
-                        if current['phase'] not in {'resuming', 'held'}:
+                        if current['phase'] not in {'resuming', 'held', 'containing'}:
                             return
                         identity = current['process']
-                        if current['phase'] == 'held' or process_identity(identity['pid']) != identity or not sessions_alive(current):
-                            self.owned_lock(current)
-                            self.system.hold_writers(current)
-                            if current['phase'] != 'held':
-                                current['phase'] = 'held'
-                                current['interrupted'] = True
-                                try:
-                                    self.persist(current)
-                                except OSError:
-                                    pass
+                        if current['phase'] in {'held', 'containing'} or process_identity(identity['pid']) != identity or not sessions_alive(current):
+                            self.contain(current)
                     if not select.select([server], [], [], 0.25)[0]:
                         continue
                     with server.accept()[0] as connection:
@@ -677,14 +685,24 @@ class Workflow:
                                 require(process_identity(identity['pid']) == identity and sessions_alive(current), 'Resume owner disappeared during unpause.')
                                 connection.sendall(b'completed\n')
                             except Exception:
-                                self.system.hold_writers(current)
-                                current['phase'] = 'held'
-                                try:
-                                    self.persist(current)
-                                except OSError:
-                                    pass
+                                self.contain(current)
             finally:
                 path.unlink(missing_ok=True)
+
+    def contain(self, job):
+        try:
+            self.owned_lock(job)
+            self.system.hold_writers(job)
+            phase = 'held'
+        except (Refusal, OSError, subprocess.SubprocessError):
+            phase = 'containing'
+        if job['phase'] != phase:
+            job['phase'] = phase
+            job['interrupted'] = True
+            try:
+                self.persist(job)
+            except OSError:
+                pass
 
 
 class Fence(http.server.BaseHTTPRequestHandler):

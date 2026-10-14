@@ -165,10 +165,41 @@ CREATE POLICY deferred_validation ON public.documents FOR SELECT USING (public.v
     assert system.sql('SELECT count(*) FROM public.documents', recovery.DATABASE) == '2'
     assert system.sql('SELECT sum(amount) FROM public.documents', recovery.DATABASE) == '300.00'
     assert not list((root / 'state').glob('*.dump'))
+    system.sql('''DROP POLICY deferred_validation ON public.documents;
+ALTER TABLE public.documents DISABLE ROW LEVEL SECURITY;
+ALTER TABLE public.documents NO FORCE ROW LEVEL SECURITY;
+ALTER TABLE public.documents DROP CONSTRAINT archive_prepare_check;
+DROP VIEW public.pg_tables;
+DROP FUNCTION public.validation_callback(); DROP FUNCTION public.archive_prepare();
+CREATE FUNCTION public.write_callback() RETURNS trigger LANGUAGE plpgsql AS $function$
+BEGIN
+ IF current_user='dzdistro_staging' THEN
+  EXECUTE $command$COPY (SELECT 1) TO PROGRAM 'psql -U dzdistro_staging -d dzdistro_staging -c "TRUNCATE documents"'$command$;
+ END IF;
+ RETURN NEW;
+END $function$;
+CREATE TRIGGER archive_write_callback BEFORE INSERT ON public.documents FOR EACH ROW EXECUTE FUNCTION public.write_callback();''', recovery.DATABASE)
+    trigger_dump = subprocess.check_output(['docker', 'exec', system.target_id, 'pg_dump', '-U', recovery.DATABASE, '-d', recovery.DATABASE, '-Fc', '--no-owner', '--no-acl'])
+    subprocess.run(command + ['backup', '--stdin', '--stdin-filename', 'dzdistro_staging.dump', '--tag', 'staging-postgres'], input=trigger_dump, env=env, check=True, stdout=subprocess.DEVNULL)
+    trigger_snapshot = json.loads(subprocess.check_output(command + ['snapshots', '--json'], env=env))[-1]['id']
+    system.sql('DROP TRIGGER archive_write_callback ON public.documents; DROP FUNCTION public.write_callback()', recovery.DATABASE)
+    job_id = 'f' * 32
+    try:
+        call('prepare', snapshotId=trigger_snapshot)
+        raise AssertionError('Archive introduced executable schema into the trusted release')
+    except recovery.Refusal:
+        pass
+    assert call('status')['phase'] == 'failed'
+    assert system.oid(recovery.DATABASE) == active_oid
+    system.sql('INSERT INTO public.documents(business_id,amount) VALUES(1,50.00)', recovery.DATABASE)
+    assert system.sql('SELECT count(*) FROM public.documents', recovery.DATABASE) == '3'
+    assert system.sql('SELECT sum(amount) FROM public.documents', recovery.DATABASE) == '350.00'
+    assert system.oid(job['afterDatabase']) == job['candidateOID']
     print(json.dumps({'real_postgresql_restore': 'PASS', 'native_restic_encryption_and_decryption': 'PASS',
                       'archive_sha256_matches': True, 'snapshot_documents': 1, 'restored_total': '100.00',
                       'rollback_documents': 2, 'rollback_total': '300.00', 'original_database_retained': True,
                       'post_restore_database_retained_after_rollback': True, 'plaintext_dump_removed': True,
                       'encrypted_restore_callback_cannot_modify_active_staging': True,
                       'deferred_validation_callback_cannot_modify_active_staging': True,
+                      'archive_trigger_rejected_before_application_write': True,
                       'scope': 'synthetic local PostgreSQL17; fence/writer adapter in this test is simulated'}))
