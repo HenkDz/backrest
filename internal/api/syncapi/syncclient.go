@@ -13,6 +13,8 @@ import (
 	"sync"
 	"time"
 
+	"connectrpc.com/connect"
+
 	"github.com/garethgeorge/backrest/gen/go/types"
 	v1 "github.com/garethgeorge/backrest/gen/go/v1"
 	"github.com/garethgeorge/backrest/gen/go/v1sync"
@@ -164,6 +166,9 @@ func (c *SyncClient) RunSync(ctx context.Context) {
 		case connectErr == nil:
 			state.ConnectionState = v1sync.ConnectionState_CONNECTION_STATE_DISCONNECTED
 			state.ConnectionStateMessage = "disconnected"
+		case connect.CodeOf(connectErr) == connect.CodePermissionDenied || connect.CodeOf(connectErr) == connect.CodeUnauthenticated:
+			state.ConnectionState = v1sync.ConnectionState_CONNECTION_STATE_ERROR_AUTH
+			state.ConnectionStateMessage = connectErr.Error()
 		case errors.As(connectErr, &syncErr):
 			c.l.Sugar().Infof("lost stream connection to peer %q (%s): %v", c.peer.InstanceId, c.peer.Keyid, connectErr)
 			state.ConnectionState = syncErr.State
@@ -347,28 +352,6 @@ func (c *syncSessionHandlerClient) OnConnectionEstablished(ctx context.Context, 
 	peerState.LastHeartbeat = time.Now()
 	c.mgr.peerStateManager.SetPeerState(peer.Keyid, peerState)
 
-	// Clear the pairing secret from the known host entry now that pairing has succeeded.
-	snapshotHosts := c.syncConfigSnapshot.config.GetMultihost().GetKnownHosts()
-	khIdx := slices.IndexFunc(snapshotHosts, func(kh *v1.Multihost_Peer) bool {
-		return kh.GetKeyid() == peer.GetKeyid()
-	})
-	if khIdx >= 0 && snapshotHosts[khIdx].GetInitialPairingSecret() != "" {
-		if err := c.mgr.configMgr.Transform(func(cfg *v1.Config) (*v1.Config, error) {
-			idx := slices.IndexFunc(cfg.GetMultihost().GetKnownHosts(), func(kh *v1.Multihost_Peer) bool {
-				return kh.GetKeyid() == peer.GetKeyid()
-			})
-			if idx >= 0 {
-				cfg.GetMultihost().GetKnownHosts()[idx].InitialPairingSecret = ""
-			}
-			cfg.Modno++
-			return cfg, nil
-		}); err != nil {
-			c.l.Sugar().Warnf("failed to clear pairing secret after successful pairing: %v", err)
-		} else {
-			c.l.Sugar().Infof("cleared pairing secret for peer %q after successful connection", peer.InstanceId)
-		}
-	}
-
 	// Send a heartbeat every interval to keep the connection alive.
 	go sendHeartbeats(ctx, stream, env.MultihostHeartbeatInterval())
 
@@ -535,7 +518,6 @@ func (c *syncSessionHandlerClient) HandleReceiveResources(ctx context.Context, s
 	return nil
 }
 
-// Note unused: there isn't a situation where the host would send its config for information, the host will only call 'SetConfig' to update the config.
 func (c *syncSessionHandlerClient) HandleReceiveConfig(ctx context.Context, stream *bidiSyncCommandStream, item *v1sync.SyncStreamItem_SyncActionReceiveConfig) error {
 	c.l.Sugar().Debugf("received remote config: %d repos, %d plans, modno=%d",
 		len(item.GetConfig().GetRepos()), len(item.GetConfig().GetPlans()), item.GetConfig().GetModno())
@@ -549,6 +531,22 @@ func (c *syncSessionHandlerClient) HandleReceiveConfig(ctx context.Context, stre
 	}
 	peerState.Config = newRemoteConfig
 	c.mgr.peerStateManager.SetPeerState(c.peer.Keyid, peerState)
+
+	// A signed handshake alone does not prove the host accepted our pairing token.
+	if c.peer.GetInitialPairingSecret() != "" {
+		if err := c.mgr.configMgr.Transform(func(cfg *v1.Config) (*v1.Config, error) {
+			for _, host := range cfg.GetMultihost().GetKnownHosts() {
+				if host.Keyid == c.peer.Keyid && host.InitialPairingSecret == c.peer.InitialPairingSecret {
+					host.InitialPairingSecret = ""
+					cfg.Modno++
+					return cfg, nil
+				}
+			}
+			return nil, nil
+		}); err != nil {
+			c.l.Sugar().Warnf("failed to clear pairing secret after successful pairing: %v", err)
+		}
+	}
 	return nil
 }
 

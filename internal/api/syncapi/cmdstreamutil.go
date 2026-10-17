@@ -181,6 +181,14 @@ func (s *bidiSyncCommandStream) ConnectStream(ctx context.Context, stream syncCo
 			}
 			if err := transport.Send(item); err != nil {
 				if errors.Is(err, io.EOF) {
+					// A rejected RPC can close writes before its status reaches the receive pump.
+					select {
+					case <-s.done:
+						return s.Err()
+					case <-ctx.Done():
+						return ctx.Err()
+					case <-time.After(time.Second):
+					}
 					err = fmt.Errorf("connection failed or dropped: %w", err)
 				}
 				s.SendErrorAndTerminate(err)

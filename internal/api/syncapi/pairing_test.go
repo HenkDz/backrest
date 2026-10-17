@@ -218,6 +218,16 @@ func TestPairingTokenFlow(t *testing.T) {
 	if len(hostConfig.Multihost.PairingTokens) != 0 {
 		t.Errorf("expected 0 pairing tokens after consumption, got %d", len(hostConfig.Multihost.PairingTokens))
 	}
+	testutil.Try(t, ctx, func() error {
+		cfg, err := peerClient.configMgr.Get()
+		if err != nil {
+			return err
+		}
+		if cfg.Multihost.KnownHosts[0].InitialPairingSecret != "" {
+			return fmt.Errorf("pairing not yet acknowledged by host")
+		}
+		return nil
+	})
 }
 
 func TestPairingTokenExpiredRejected(t *testing.T) {
@@ -281,6 +291,10 @@ func TestPairingTokenExpiredRejected(t *testing.T) {
 	hostConfig, _ := peerHost.configMgr.Get()
 	if len(hostConfig.Multihost.AuthorizedClients) != 0 {
 		t.Errorf("expected 0 authorized clients, got %d", len(hostConfig.Multihost.AuthorizedClients))
+	}
+	clientConfig, _ := peerClient.configMgr.Get()
+	if clientConfig.Multihost.KnownHosts[0].InitialPairingSecret != pairingSecret {
+		t.Error("rejected pairing must retain the token")
 	}
 }
 
@@ -350,6 +364,16 @@ func TestPairingTokenMaxUsesEnforced(t *testing.T) {
 	}()
 
 	tryConnect(t, ctx, peerClient1, peerClient1Config.Multihost.KnownHosts[0])
+	testutil.Try(t, ctx, func() error {
+		cfg, err := peerHost.configMgr.Get()
+		if err != nil {
+			return err
+		}
+		if len(cfg.Multihost.PairingTokens) != 0 || len(cfg.Multihost.AuthorizedClients) != 1 {
+			return fmt.Errorf("host has not committed pairing")
+		}
+		return nil
+	})
 
 	// Stop first client, start second client with same pairing secret.
 	cancelSync()
