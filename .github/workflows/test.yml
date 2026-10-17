@@ -30,11 +30,12 @@ jobs:
             --label coolify.resourceName=dzdistro-staging-postgres --label coolify.type=database \
             -e POSTGRES_USER=dzdistro_staging -e POSTGRES_DB=dzdistro_staging \
             -e POSTGRES_PASSWORD=synthetic-fixture-only postgres:17-alpine
+          # The temporary initialization server accepts Unix sockets before final TCP startup.
           for attempt in $(seq 1 60); do
-            docker exec nhws-recovery-test-ci pg_isready -U dzdistro_staging && break
+            docker exec nhws-recovery-test-ci pg_isready -h 127.0.0.1 -U dzdistro_staging && break
             sleep 1
           done
-          docker exec nhws-recovery-test-ci pg_isready -U dzdistro_staging
+          docker exec nhws-recovery-test-ci pg_isready -h 127.0.0.1 -U dzdistro_staging
           docker run --rm --network none -v /var/run/docker.sock:/var/run/docker.sock \
             -v "$PWD/scripts:/tests:ro" --entrypoint python3 nhws-recovery-fixture:local \
             /tests/test_nhws_recovery_postgres.py nhws-recovery-test-ci
@@ -47,7 +48,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: "1.24"
+          go-version-file: go.mod
 
       - name: Install gotestsum
         run: go install gotest.tools/gotestsum@latest
@@ -104,7 +105,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: "1.24"
+          go-version-file: go.mod
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -189,7 +190,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: "1.24"
+          go-version-file: go.mod
 
       - name: Create Fake WebUI Sources
         run: |
