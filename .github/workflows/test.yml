@@ -15,6 +15,31 @@ on:
   workflow_dispatch:
 
 jobs:
+  test-database-recovery:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Test staging recovery refusal and failure gates
+        run: python3 scripts/test_nhws_staging_recovery.py
+      - name: Build isolated recovery fixture
+        run: docker build -f test/fixtures/nhws-recovery/Dockerfile -t nhws-recovery-fixture:local .
+      - name: Rehearse encrypted PostgreSQL restore and rollback
+        run: |
+          docker run -d --name nhws-recovery-test-ci --label nhws.recovery-fixture=true \
+            --label coolify.projectName=dzdistro --label coolify.environmentName=staging \
+            --label coolify.resourceName=dzdistro-staging-postgres --label coolify.type=database \
+            -e POSTGRES_USER=dzdistro_staging -e POSTGRES_DB=dzdistro_staging \
+            -e POSTGRES_PASSWORD=synthetic-fixture-only postgres:17-alpine
+          # The temporary initialization server accepts Unix sockets before final TCP startup.
+          for attempt in $(seq 1 60); do
+            docker exec nhws-recovery-test-ci pg_isready -h 127.0.0.1 -U dzdistro_staging && break
+            sleep 1
+          done
+          docker exec nhws-recovery-test-ci pg_isready -h 127.0.0.1 -U dzdistro_staging
+          docker run --rm --network none -v /var/run/docker.sock:/var/run/docker.sock \
+            -v "$PWD/scripts:/tests:ro" --entrypoint python3 nhws-recovery-fixture:local \
+            /tests/test_nhws_recovery_postgres.py nhws-recovery-test-ci
+
   test-nix:
     runs-on: ubuntu-latest
     steps:
@@ -23,7 +48,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: "1.24"
+          go-version-file: go.mod
 
       - name: Install gotestsum
         run: go install gotest.tools/gotestsum@latest
@@ -80,7 +105,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: "1.24"
+          go-version-file: go.mod
 
       - name: Setup pnpm
         uses: pnpm/action-setup@v4
@@ -165,7 +190,7 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v4
         with:
-          go-version: "1.24"
+          go-version-file: go.mod
 
       - name: Create Fake WebUI Sources
         run: |

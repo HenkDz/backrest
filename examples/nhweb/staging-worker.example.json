@@ -1,0 +1,20 @@
+{
+  "schemaVersion": 1,
+  "environment": "staging",
+  "container": "REPLACE_WITH_PINNED_STAGING_POSTGRES_CONTAINER",
+  "writers": {
+    "web": "REPLACE_WITH_STAGING_WEB_APPLICATION_UUID",
+    "queue": "REPLACE_WITH_STAGING_QUEUE_APPLICATION_UUID",
+    "scheduler": "REPLACE_WITH_STAGING_SCHEDULER_APPLICATION_UUID",
+    "pulse": "REPLACE_WITH_STAGING_PULSE_APPLICATION_UUID",
+    "release": "REPLACE_WITH_STAGING_RELEASE_APPLICATION_UUID"
+  },
+  "repository": "sftp:dzdistro-staging-storage:repo",
+  "repositoryId": "REPLACE_WITH_RESTIC_CAT_CONFIG_ID",
+  "passwordFile": "/etc/dzdistro-backups/staging-password",
+  "sshConfig": "/etc/dzdistro-backups/staging-ssh-config",
+  "stateDir": "/var/lib/nhweb-backups/staging-recovery",
+  "publicURL": "https://test.dzdistro.com",
+  "fenceBackend": "http://host.docker.internal:8790",
+  "proxyConfig": "/data/coolify/proxy/dynamic/nhws-staging-recovery.yml"
+}

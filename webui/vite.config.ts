@@ -48,6 +48,10 @@ export default defineConfig(({ mode }) => {
     },
     server: {
       proxy: {
+        '/api/database-restore': {
+          target: env.UI_BACKEND_URL || 'http://localhost:9898',
+          secure: false,
+        },
         '/v1.Backrest': {
           target: env.UI_BACKEND_URL || 'http://localhost:9898',
           secure: false,

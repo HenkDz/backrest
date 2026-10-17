@@ -106,17 +106,18 @@ func (m *SyncManager) GetSyncClients() map[string]*SyncClient {
 func (m *SyncManager) RunSync(ctx context.Context) {
 	var syncWg sync.WaitGroup
 	var cancelLastSync context.CancelFunc
-
-	configWatchCh := m.configMgr.OnChange.Subscribe()
-	defer m.configMgr.OnChange.Unsubscribe(configWatchCh)
 	defer func() {
+		if cancelLastSync != nil {
+			cancelLastSync()
+		}
+		syncWg.Wait()
 		zap.L().Info("syncmanager exited")
 	}()
 
-	startSync := func(config *v1.Config) {
-		m.mu.Lock()
-		defer m.mu.Unlock()
+	configWatchCh := m.configMgr.OnChange.Subscribe()
+	defer m.configMgr.OnChange.Unsubscribe(configWatchCh)
 
+	startSync := func(config *v1.Config) {
 		if cancelLastSync != nil {
 			cancelLastSync()
 			zap.L().Info("syncmanager applying new config, waiting for existing sync goroutines to exit")
@@ -124,6 +125,8 @@ func (m *SyncManager) RunSync(ctx context.Context) {
 		} else {
 			zap.L().Info("syncmanager applying new config, starting sync goroutines")
 		}
+		m.mu.Lock()
+		defer m.mu.Unlock()
 		syncCtx, cancel := context.WithCancel(ctx)
 		cancelLastSync = cancel
 
@@ -236,8 +239,7 @@ func (m *SyncManager) RunSync(ctx context.Context) {
 	}
 }
 
-// runSyncWithPeerInternal starts the sync process with a single peer. It is expected to spawn a goroutine that will
-// return when the context is canceled. Errors can only be returned upfront.
+// runSyncWithPeerInternal runs in a manager-owned goroutine until its context is cancelled.
 func (m *SyncManager) runSyncWithPeerInternal(ctx context.Context, config *v1.Config, knownHostPeer *v1.Multihost_Peer) error {
 	if config.Instance == "" {
 		return errors.New("local instance must set instance name before peersync can be enabled")
@@ -253,17 +255,12 @@ func (m *SyncManager) runSyncWithPeerInternal(ctx context.Context, config *v1.Co
 	m.syncClients[knownHostPeer.Keyid] = newClient
 	m.mu.Unlock()
 
-	go func() {
-		newClient.RunSync(ctx)
-		m.mu.Lock()
-		// Only remove the entry if it still points at us. On reconfiguration the new
-		// client may have already inserted itself under the same key; deleting blindly
-		// would wipe the replacement.
-		if m.syncClients[knownHostPeer.Keyid] == newClient {
-			delete(m.syncClients, knownHostPeer.Keyid)
-		}
-		m.mu.Unlock()
-	}()
+	newClient.RunSync(ctx)
+	m.mu.Lock()
+	if m.syncClients[knownHostPeer.Keyid] == newClient {
+		delete(m.syncClients, knownHostPeer.Keyid)
+	}
+	m.mu.Unlock()
 
 	return nil
 }

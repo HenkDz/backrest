@@ -92,6 +92,10 @@ Shared repos are identified by their GUID. If the client already has a local rep
 
 ## Monitoring Sync Status
 
+When configuration changes or sync shuts down, the manager cancels and waits for its existing clients before returning or starting replacements. This prevents old sessions from outliving their owner during reconnects.
+
+Clients keep the initial pairing token until the host sends its accepted configuration. Authentication refusals appear as authentication errors, and rejected pairing attempts retain the token. Explicit operation requests follow the same repository/plan permissions and local-origin restrictions as live updates.
+
 After setup, the server's Settings page shows the connection status of each authorized client. A green indicator means the client is currently connected and syncing.
 
 The sync protocol uses a persistent bidirectional connection with:
