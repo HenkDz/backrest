@@ -98,6 +98,8 @@ Native tests additionally kill the worker after web is proven unpaused and the n
 
 ## Initial limits
 
+Status polling allows one pending read at a time. Manual refreshes and recovery actions invalidate earlier reads, so a delayed response cannot replace a newer workflow step or its confirmation controls.
+
 - Database-only recovery: uploads, application secrets, cluster roles/ACLs and PITR are outside this backup.
 - The current staging schema must remain readable and compatible. Missing/corrupt schema or a migration mismatch requires an explicitly assessed manual recovery; there is no force option.
 - Decrypted archives are bounded to256MiB. Normal completion/failure deletes them; a process/host crash can leave a private archive requiring operator cleanup.
