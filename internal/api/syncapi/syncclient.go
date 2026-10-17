@@ -476,6 +476,9 @@ func (c *syncSessionHandlerClient) HandleRequestOperationData(ctx context.Contex
 			if err != nil {
 				continue // may have been deleted between manifest and request
 			}
+			if !c.canForwardOperation(op) {
+				continue
+			}
 			ops = append(ops, op)
 		}
 		if len(ops) == 0 {

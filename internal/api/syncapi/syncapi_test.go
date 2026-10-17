@@ -122,6 +122,63 @@ func TestConnectionSucceeds(t *testing.T) {
 	tryConnect(t, ctx, peerClient, peerClientConfig.Multihost.KnownHosts[0])
 }
 
+func TestOperationRequestsEnforcePermissionsAndOrigin(t *testing.T) {
+	store, err := sqlitestore.NewMemorySqliteStore(t)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+	log, err := oplog.NewOpLog(store)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ops := []*v1.Operation{
+		{InstanceId: defaultClientID, RepoGuid: "allowed-repo"},
+		{InstanceId: defaultClientID, RepoGuid: "other-repo", PlanId: "allowed-plan"},
+		{InstanceId: defaultClientID, RepoGuid: "other-repo", PlanId: "other-plan"},
+		{InstanceId: "foreign-instance", RepoGuid: "allowed-repo"},
+		{InstanceId: defaultClientID, RepoGuid: "allowed-repo", OriginalInstanceKeyid: identity1.Keyid, OriginalId: 99},
+	}
+	for _, op := range ops {
+		op.RepoId = defaultRepoID
+		if op.PlanId == "" {
+			op.PlanId = defaultPlanID
+		}
+		op.UnixTimeStartMs = time.Now().UnixMilli()
+	}
+	if err := log.Add(ops...); err != nil {
+		t.Fatal(err)
+	}
+	handler := &syncSessionHandlerClient{
+		localInstanceID: defaultClientID, oplog: log,
+		canForwardReposSet: map[string]struct{}{"allowed-repo": {}},
+		canForwardPlansSet: map[string]struct{}{"allowed-plan": {}},
+	}
+	stream := newBidiSyncCommandStream()
+	request := &v1sync.SyncStreamItem_SyncActionRequestOperationData{OpIds: []int64{
+		ops[0].Id, ops[1].Id, ops[2].Id, ops[3].Id, ops[4].Id, -1,
+	}}
+	if err := handler.HandleRequestOperationData(context.Background(), stream, request); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case response := <-stream.sendChan:
+		got := response.GetReceiveOperations().GetEvent().GetUpdatedOperations().GetOperations()
+		if diff := cmp.Diff(ops[:2], got, protocmp.Transform()); diff != "" {
+			t.Fatalf("operation request escaped permissions/origin filter: %s", diff)
+		}
+	default:
+		t.Fatal("permitted operations were not returned")
+	}
+	request.OpIds = request.OpIds[2:]
+	if err := handler.HandleRequestOperationData(context.Background(), stream, request); err != nil {
+		t.Fatal(err)
+	}
+	if len(stream.sendChan) != 0 {
+		t.Fatal("forbidden-only request disclosed operations")
+	}
+}
+
 func TestConnectionBadKeyRejected(t *testing.T) {
 	testutil.InstallZapLogger(t)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
