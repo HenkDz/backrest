@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import {
   Badge,
   Box,
@@ -276,6 +276,7 @@ export const DatabaseRestore = () => {
   const [elapsed, setElapsed] = useState(0);
   const [discarding, setDiscarding] = useState(false);
   const [error, setError] = useState("");
+  const requestVersion = useRef(0);
   const job = state?.job;
   const next = recoveryAction(job);
   const updateState = (result: RecoveryState) => {
@@ -291,6 +292,7 @@ export const DatabaseRestore = () => {
   };
 
   const request = async (action?: string, phrase?: string) => {
+    const version = ++requestVersion.current;
     setBusy(true);
     setPending(action);
     setError("");
@@ -319,13 +321,17 @@ export const DatabaseRestore = () => {
       } catch {
         throw new Error("Sign in again or refresh the recovery status.");
       }
+      if (version !== requestVersion.current) return;
       if (!response.ok) {
         if (action === "prepare") {
           try {
             const status = await authenticatedFetch(
               `${backendUrl.replace(/\/$/, "")}/api/database-restore`,
             );
-            if (status.ok) updateState(await status.json());
+            if (status.ok) {
+              const current = await status.json();
+              if (version === requestVersion.current) updateState(current);
+            }
           } catch {
             // Preserve the test failure if its status cannot be refreshed.
           }
@@ -339,14 +345,18 @@ export const DatabaseRestore = () => {
       setConfirmation("");
       setReconciled(false);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Recovery request failed.");
+      if (version === requestVersion.current)
+        setError(e instanceof Error ? e.message : "Recovery request failed.");
     } finally {
-      setBusy(false);
+      if (version === requestVersion.current) setBusy(false);
     }
   };
 
   useEffect(() => {
     void request();
+    return () => {
+      requestVersion.current++;
+    };
   }, []);
   useEffect(() => {
     if (!busy) return;
@@ -361,17 +371,30 @@ export const DatabaseRestore = () => {
   // Read-only status polling while the worker advances a phase on its own.
   useEffect(() => {
     if (busy || !job || !transient.includes(job.phase)) return;
+    const version = requestVersion.current;
+    let active = true;
+    let inFlight = false;
     const timer = setInterval(async () => {
+      if (inFlight) return;
+      inFlight = true;
       try {
         const response = await authenticatedFetch(
           `${backendUrl.replace(/\/$/, "")}/api/database-restore`,
         );
-        if (response.ok) updateState(await response.json());
+        if (response.ok) {
+          const result = await response.json();
+          if (active && version === requestVersion.current) updateState(result);
+        }
       } catch {
         // The manual refresh remains available.
+      } finally {
+        inFlight = false;
       }
     }, 5000);
-    return () => clearInterval(timer);
+    return () => {
+      active = false;
+      clearInterval(timer);
+    };
   }, [busy, job?.phase]);
   const openJob = job && !["failed", "aborted", "resumed"].includes(job.phase);
   const selectionDisabled = busy || !!openJob || !state;

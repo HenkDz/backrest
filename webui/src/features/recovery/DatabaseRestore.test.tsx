@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { fireEvent, screen, waitFor } from "@testing-library/react";
+import { act, fireEvent, screen, waitFor } from "@testing-library/react";
 import { renderWithProviders as render } from "../../test/render";
 import {
   DatabaseRestore,
@@ -169,6 +169,69 @@ describe("guided staging recovery", () => {
       { target: { value: "RESTORE DZDISTRO STAGING aaaaaaaa" } },
     );
     expect(button).toBeEnabled();
+  });
+  it("serializes polling and ignores late reads after a refresh and pause", async () => {
+    const timers = vi.spyOn(globalThis, "setInterval");
+    let reads = 0;
+    let finishPoll!: (response: unknown) => void;
+    const delayed = new Promise((resolve) => {
+      finishPoll = resolve;
+    });
+    fetchRecovery.mockImplementation(async (url, options) => {
+      if (String(url).includes("view=snapshots"))
+        return { ok: true, json: async () => page };
+      if (options?.method === "POST")
+        return { ok: true, json: async () => status(baseJob) };
+      reads++;
+      if (reads === 2) return delayed;
+      return {
+        ok: true,
+        json: async () =>
+          status({
+            ...baseJob,
+            phase: reads === 1 ? "preparing" : "validated",
+          }),
+      };
+    });
+    render(<DatabaseRestore />);
+    await screen.findByRole("heading", { name: "Recovery status: preparing" });
+    const poll = timers.mock.calls.find(
+      (call) => call[1] === 5000,
+    )![0] as () => void | Promise<void>;
+    try {
+      act(() => {
+        void poll();
+        void poll();
+      });
+      expect(reads).toBe(2);
+      fireEvent.click(
+        screen.getByRole("button", { name: /Refresh recovery status/ }),
+      );
+      const pause = await screen.findByRole("button", {
+        name: "Pause staging",
+      });
+      fireEvent.change(
+        screen.getByRole("textbox", { name: "Recovery confirmation" }),
+        { target: { value: "PAUSE DZDISTRO STAGING" } },
+      );
+      fireEvent.click(pause);
+      await screen.findByRole("button", { name: "Restore staging database" });
+      await act(async () => {
+        finishPoll({
+          ok: true,
+          json: async () => status({ ...baseJob, phase: "validated" }),
+        });
+        await delayed;
+      });
+      expect(
+        screen.getByRole("button", { name: "Restore staging database" }),
+      ).toBeInTheDocument();
+      expect(
+        screen.queryByRole("button", { name: "Pause staging" }),
+      ).not.toBeInTheDocument();
+    } finally {
+      timers.mockRestore();
+    }
   });
   it.each(["restored", "resume-committed"])(
     "requires reconciliation before resuming %s",
