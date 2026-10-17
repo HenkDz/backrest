@@ -133,8 +133,9 @@ func TestPairingTokenFlow(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	peerHostAddr := testutil.AllocOpenBindAddr(t)
-	peerClientAddr := testutil.AllocOpenBindAddr(t)
+	peerHostListener := listenSyncAPI(t, "127.0.0.1:0")
+	peerHostAddr := peerHostListener.Addr().String()
+	peerClientListener := listenSyncAPI(t, "127.0.0.1:0")
 
 	pairingSecret, err := cryptoutil.GeneratePairingSecret()
 	if err != nil {
@@ -183,8 +184,8 @@ func TestPairingTokenFlow(t *testing.T) {
 	peerHost := newPeerUnderTest(t, peerHostConfig)
 	peerClient := newPeerUnderTest(t, peerClientConfig)
 
-	startRunningSyncAPI(t, peerHost, peerHostAddr)
-	startRunningSyncAPI(t, peerClient, peerClientAddr)
+	startRunningSyncAPI(t, peerHost, peerHostListener)
+	startRunningSyncAPI(t, peerClient, peerClientListener)
 
 	// The client should successfully connect via the pairing token.
 	tryConnect(t, ctx, peerClient, peerClientConfig.Multihost.KnownHosts[0])
@@ -224,8 +225,9 @@ func TestPairingTokenExpiredRejected(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	peerHostAddr := testutil.AllocOpenBindAddr(t)
-	peerClientAddr := testutil.AllocOpenBindAddr(t)
+	peerHostListener := listenSyncAPI(t, "127.0.0.1:0")
+	peerHostAddr := peerHostListener.Addr().String()
+	peerClientListener := listenSyncAPI(t, "127.0.0.1:0")
 
 	pairingSecret, _ := cryptoutil.GeneratePairingSecret()
 
@@ -269,8 +271,8 @@ func TestPairingTokenExpiredRejected(t *testing.T) {
 	peerHost := newPeerUnderTest(t, peerHostConfig)
 	peerClient := newPeerUnderTest(t, peerClientConfig)
 
-	startRunningSyncAPI(t, peerHost, peerHostAddr)
-	startRunningSyncAPI(t, peerClient, peerClientAddr)
+	startRunningSyncAPI(t, peerHost, peerHostListener)
+	startRunningSyncAPI(t, peerClient, peerClientListener)
 
 	// Connection should fail with auth error.
 	waitForConnectionState(t, ctx, peerClient, peerClientConfig.Multihost.KnownHosts[0], v1sync.ConnectionState_CONNECTION_STATE_ERROR_AUTH)
@@ -287,7 +289,8 @@ func TestPairingTokenMaxUsesEnforced(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	peerHostAddr := testutil.AllocOpenBindAddr(t)
+	peerHostListener := listenSyncAPI(t, "127.0.0.1:0")
+	peerHostAddr := peerHostListener.Addr().String()
 
 	pairingSecret, _ := cryptoutil.GeneratePairingSecret()
 
@@ -337,13 +340,13 @@ func TestPairingTokenMaxUsesEnforced(t *testing.T) {
 
 	var wg sync.WaitGroup
 	syncCtx, cancelSync := context.WithCancel(ctx)
+	peerClient1Listener := listenSyncAPI(t, "127.0.0.1:0")
 
 	wg.Add(2)
-	go func() { defer wg.Done(); runSyncAPIWithCtx(syncCtx, peerHost, peerHostAddr) }()
+	go func() { defer wg.Done(); runSyncAPIWithCtx(syncCtx, peerHost, peerHostListener) }()
 	go func() {
 		defer wg.Done()
-		peerClient1Addr := testutil.AllocOpenBindAddr(t)
-		runSyncAPIWithCtx(syncCtx, peerClient1, peerClient1Addr)
+		runSyncAPIWithCtx(syncCtx, peerClient1, peerClient1Listener)
 	}()
 
 	tryConnect(t, ctx, peerClient1, peerClient1Config.Multihost.KnownHosts[0])
@@ -370,9 +373,10 @@ func TestPairingTokenMaxUsesEnforced(t *testing.T) {
 	}
 
 	peerClient2 := newPeerUnderTest(t, peerClient2Config)
+	peerHostListener = listenSyncAPI(t, peerHostAddr)
 
-	startRunningSyncAPI(t, peerHost, peerHostAddr)
-	startRunningSyncAPI(t, peerClient2, testutil.AllocOpenBindAddr(t))
+	startRunningSyncAPI(t, peerHost, peerHostListener)
+	startRunningSyncAPI(t, peerClient2, listenSyncAPI(t, "127.0.0.1:0"))
 
 	// Second client should fail — token is consumed.
 	waitForConnectionState(t, ctx, peerClient2, peerClient2Config.Multihost.KnownHosts[0], v1sync.ConnectionState_CONNECTION_STATE_ERROR_AUTH)
@@ -383,8 +387,9 @@ func TestNoPairingSecretRejected(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 
-	peerHostAddr := testutil.AllocOpenBindAddr(t)
-	peerClientAddr := testutil.AllocOpenBindAddr(t)
+	peerHostListener := listenSyncAPI(t, "127.0.0.1:0")
+	peerHostAddr := peerHostListener.Addr().String()
+	peerClientListener := listenSyncAPI(t, "127.0.0.1:0")
 
 	// Host has NO pairing tokens and NO authorized clients.
 	peerHostConfig := &v1.Config{
@@ -417,8 +422,8 @@ func TestNoPairingSecretRejected(t *testing.T) {
 	peerHost := newPeerUnderTest(t, peerHostConfig)
 	peerClient := newPeerUnderTest(t, peerClientConfig)
 
-	startRunningSyncAPI(t, peerHost, peerHostAddr)
-	startRunningSyncAPI(t, peerClient, peerClientAddr)
+	startRunningSyncAPI(t, peerHost, peerHostListener)
+	startRunningSyncAPI(t, peerClient, peerClientListener)
 
 	waitForConnectionState(t, ctx, peerClient, peerClientConfig.Multihost.KnownHosts[0], v1sync.ConnectionState_CONNECTION_STATE_ERROR_AUTH)
 }

@@ -92,6 +92,8 @@ Shared repos are identified by their GUID. If the client already has a local rep
 
 ## Monitoring Sync Status
 
+When configuration changes or sync shuts down, the manager cancels and waits for its existing clients before returning or starting replacements. This prevents old sessions from outliving their owner during reconnects.
+
 After setup, the server's Settings page shows the connection status of each authorized client. A green indicator means the client is currently connected and syncing.
 
 The sync protocol uses a persistent bidirectional connection with:

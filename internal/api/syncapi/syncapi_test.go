@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"path/filepath"
 	"slices"
@@ -77,8 +78,9 @@ func TestConnectionSucceeds(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	peerHostAddr := testutil.AllocOpenBindAddr(t)
-	peerClientAddr := testutil.AllocOpenBindAddr(t)
+	peerHostListener := listenSyncAPI(t, "127.0.0.1:0")
+	peerClientListener := listenSyncAPI(t, "127.0.0.1:0")
+	peerHostAddr := peerHostListener.Addr().String()
 
 	peerHostConfig := &v1.Config{
 		Version:  migrations.CurrentVersion,
@@ -88,8 +90,8 @@ func TestConnectionSucceeds(t *testing.T) {
 			Identity: identity1,
 			AuthorizedClients: []*v1.Multihost_Peer{
 				{
-					Keyid:         identity2.Keyid,
-										InstanceId:    defaultClientID,
+					Keyid:      identity2.Keyid,
+					InstanceId: defaultClientID,
 				},
 			},
 		},
@@ -114,8 +116,8 @@ func TestConnectionSucceeds(t *testing.T) {
 	peerHost := newPeerUnderTest(t, peerHostConfig)
 	peerClient := newPeerUnderTest(t, peerClientConfig)
 
-	startRunningSyncAPI(t, peerHost, peerHostAddr)
-	startRunningSyncAPI(t, peerClient, peerClientAddr)
+	startRunningSyncAPI(t, peerHost, peerHostListener)
+	startRunningSyncAPI(t, peerClient, peerClientListener)
 
 	tryConnect(t, ctx, peerClient, peerClientConfig.Multihost.KnownHosts[0])
 }
@@ -125,8 +127,9 @@ func TestConnectionBadKeyRejected(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	peerHostAddr := testutil.AllocOpenBindAddr(t)
-	peerClientAddr := testutil.AllocOpenBindAddr(t)
+	peerHostListener := listenSyncAPI(t, "127.0.0.1:0")
+	peerClientListener := listenSyncAPI(t, "127.0.0.1:0")
+	peerHostAddr := peerHostListener.Addr().String()
 
 	// Host has identity1, and authorizes no one.
 	peerHostConfig := &v1.Config{
@@ -159,8 +162,8 @@ func TestConnectionBadKeyRejected(t *testing.T) {
 	peerHost := newPeerUnderTest(t, peerHostConfig)
 	peerClient := newPeerUnderTest(t, peerClientConfig)
 
-	startRunningSyncAPI(t, peerHost, peerHostAddr)
-	startRunningSyncAPI(t, peerClient, peerClientAddr)
+	startRunningSyncAPI(t, peerHost, peerHostListener)
+	startRunningSyncAPI(t, peerClient, peerClientListener)
 
 	waitForConnectionState(t, ctx, peerClient, peerClientConfig.Multihost.KnownHosts[0], v1sync.ConnectionState_CONNECTION_STATE_ERROR_AUTH)
 }
@@ -170,8 +173,9 @@ func TestSyncConfigChange(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	peerHostAddr := testutil.AllocOpenBindAddr(t)
-	peerClientAddr := testutil.AllocOpenBindAddr(t)
+	peerHostListener := listenSyncAPI(t, "127.0.0.1:0")
+	peerClientListener := listenSyncAPI(t, "127.0.0.1:0")
+	peerHostAddr := peerHostListener.Addr().String()
 
 	peerHostConfig := &v1.Config{
 		Version:  migrations.CurrentVersion,
@@ -193,8 +197,8 @@ func TestSyncConfigChange(t *testing.T) {
 			Identity: identity1,
 			AuthorizedClients: []*v1.Multihost_Peer{
 				{
-					Keyid:         identity2.Keyid,
-										InstanceId:    defaultClientID,
+					Keyid:      identity2.Keyid,
+					InstanceId: defaultClientID,
 					Permissions: []*v1.Multihost_Permission{
 						{
 							Type: v1.Multihost_Permission_PERMISSION_READ_CONFIG,
@@ -233,8 +237,8 @@ func TestSyncConfigChange(t *testing.T) {
 	peerHost := newPeerUnderTest(t, peerHostConfig)
 	peerClient := newPeerUnderTest(t, peerClientConfig)
 
-	startRunningSyncAPI(t, peerHost, peerHostAddr)
-	startRunningSyncAPI(t, peerClient, peerClientAddr)
+	startRunningSyncAPI(t, peerHost, peerHostListener)
+	startRunningSyncAPI(t, peerClient, peerClientListener)
 
 	tryConnect(t, ctx, peerClient, peerClientConfig.Multihost.KnownHosts[0])
 
@@ -276,8 +280,9 @@ func TestSimpleOperationSync(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	peerHostAddr := testutil.AllocOpenBindAddr(t)
-	peerClientAddr := testutil.AllocOpenBindAddr(t)
+	peerHostListener := listenSyncAPI(t, "127.0.0.1:0")
+	peerClientListener := listenSyncAPI(t, "127.0.0.1:0")
+	peerHostAddr := peerHostListener.Addr().String()
 
 	peerHostConfig := &v1.Config{
 		Version:  migrations.CurrentVersion,
@@ -293,8 +298,8 @@ func TestSimpleOperationSync(t *testing.T) {
 			Identity: identity1,
 			AuthorizedClients: []*v1.Multihost_Peer{
 				{
-					Keyid:         identity2.Keyid,
-										InstanceId:    defaultClientID,
+					Keyid:      identity2.Keyid,
+					InstanceId: defaultClientID,
 				},
 			},
 		},
@@ -362,8 +367,8 @@ func TestSimpleOperationSync(t *testing.T) {
 		t.Fatalf("failed to add operations: %v", err)
 	}
 
-	startRunningSyncAPI(t, peerHost, peerHostAddr)
-	startRunningSyncAPI(t, peerClient, peerClientAddr)
+	startRunningSyncAPI(t, peerHost, peerHostListener)
+	startRunningSyncAPI(t, peerClient, peerClientListener)
 
 	tryConnect(t, ctx, peerClient, peerClientConfig.Multihost.KnownHosts[0])
 
@@ -402,8 +407,9 @@ func TestSyncMutations(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	peerHostAddr := testutil.AllocOpenBindAddr(t)
-	peerClientAddr := testutil.AllocOpenBindAddr(t)
+	peerHostListener := listenSyncAPI(t, "127.0.0.1:0")
+	peerClientListener := listenSyncAPI(t, "127.0.0.1:0")
+	peerHostAddr := peerHostListener.Addr().String()
 
 	peerHostConfig := &v1.Config{
 		Version:  migrations.CurrentVersion,
@@ -419,8 +425,8 @@ func TestSyncMutations(t *testing.T) {
 			Identity: identity1,
 			AuthorizedClients: []*v1.Multihost_Peer{
 				{
-					Keyid:         identity2.Keyid,
-										InstanceId:    defaultClientID,
+					Keyid:      identity2.Keyid,
+					InstanceId: defaultClientID,
 				},
 			},
 		},
@@ -475,11 +481,11 @@ func TestSyncMutations(t *testing.T) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		runSyncAPIWithCtx(syncCtx, peerHost, peerHostAddr)
+		runSyncAPIWithCtx(syncCtx, peerHost, peerHostListener)
 	}()
 	go func() {
 		defer wg.Done()
-		runSyncAPIWithCtx(syncCtx, peerClient, peerClientAddr)
+		runSyncAPIWithCtx(syncCtx, peerClient, peerClientListener)
 	}()
 	tryConnect(t, ctx, peerClient, peerClientConfig.Multihost.KnownHosts[0])
 
@@ -513,16 +519,18 @@ func TestSyncMutations(t *testing.T) {
 	}
 
 	// Now restart sync and check that the offline edit is applied
+	peerHostListener = listenSyncAPI(t, peerHostAddr)
+	peerClientListener = listenSyncAPI(t, peerClientListener.Addr().String())
 	syncCtx, cancelSyncCtx = context.WithCancel(ctx)
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		runSyncAPIWithCtx(syncCtx, peerHost, peerHostAddr)
+		runSyncAPIWithCtx(syncCtx, peerHost, peerHostListener)
 	}()
 
 	go func() {
 		defer wg.Done()
-		runSyncAPIWithCtx(syncCtx, peerClient, peerClientAddr)
+		runSyncAPIWithCtx(syncCtx, peerClient, peerClientListener)
 	}()
 	tryConnect(t, ctx, peerClient, peerClientConfig.Multihost.KnownHosts[0])
 
@@ -647,13 +655,13 @@ func waitForConnectionState(t *testing.T, ctx context.Context, peer *peerUnderTe
 	onStateChanged := peer.manager.peerStateManager.OnStateChanged().Subscribe()
 	defer peer.manager.peerStateManager.OnStateChanged().Unsubscribe(onStateChanged)
 
-	// First check if the peer is already connected.
+	// First check whether the peer already has the requested state.
 	state := peer.manager.peerStateManager.GetPeerState(hostPeer.Keyid)
-	if state != nil && state.ConnectionState == v1sync.ConnectionState_CONNECTION_STATE_CONNECTED {
-		return // Already connected, nothing to do
+	if state != nil && state.ConnectionState == wantState {
+		return
 	}
 
-	// If not connected, wait for a connection event
+	// Otherwise wait for the requested state change.
 	var lastState *PeerState
 	stop := false
 	for !stop {
@@ -665,7 +673,7 @@ func waitForConnectionState(t *testing.T, ctx context.Context, peer *peerUnderTe
 			}
 			if state.KeyID == hostPeer.Keyid && state.InstanceID == hostPeer.InstanceId {
 				lastState = state
-				if state.ConnectionState == v1sync.ConnectionState_CONNECTION_STATE_CONNECTED {
+				if state.ConnectionState == wantState {
 					stop = true
 					continue
 				}
@@ -677,8 +685,8 @@ func waitForConnectionState(t *testing.T, ctx context.Context, peer *peerUnderTe
 	}
 	if lastState == nil {
 		t.Fatalf("timeout waiting for connection to host peer %s", hostPeer.InstanceId)
-	} else if lastState.ConnectionState != v1sync.ConnectionState_CONNECTION_STATE_CONNECTED {
-		t.Fatalf("expected connection state to be CONNECTED, got %v (reason: %q)", lastState.ConnectionState, lastState.ConnectionStateMessage)
+	} else if lastState.ConnectionState != wantState {
+		t.Fatalf("expected connection state %v, got %v (reason: %q)", wantState, lastState.ConnectionState, lastState.ConnectionStateMessage)
 	}
 }
 
@@ -686,13 +694,82 @@ func tryConnect(t *testing.T, ctx context.Context, peer *peerUnderTest, hostPeer
 	waitForConnectionState(t, ctx, peer, hostPeer, v1sync.ConnectionState_CONNECTION_STATE_CONNECTED)
 }
 
-func runSyncAPIWithCtx(ctx context.Context, peer *peerUnderTest, bindAddr string) {
+// Keep the port reserved from configuration through serving.
+func listenSyncAPI(t *testing.T, address string) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("tcp", address)
+	if err != nil {
+		t.Fatalf("listen for sync test: %v", err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	return listener
+}
+
+func TestSyncAPIListenerReservesAddress(t *testing.T) {
+	listener := listenSyncAPI(t, "127.0.0.1:0")
+	other, err := net.Listen("tcp", listener.Addr().String())
+	if err == nil {
+		other.Close()
+		t.Fatal("sync fixture released its configured port")
+	}
+}
+
+func TestConnectionStateWaitUsesRequestedState(t *testing.T) {
+	pool, err := sql.Open("sqlite3", memdb.TestDB(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pool.Close() })
+	states, err := NewSqlitePeerStateManager(pool)
+	if err != nil {
+		t.Fatal(err)
+	}
+	state := newPeerState(defaultHostID, identity1.Keyid)
+	state.ConnectionState = v1sync.ConnectionState_CONNECTION_STATE_ERROR_AUTH
+	states.SetPeerState(identity1.Keyid, state)
+	peer := &peerUnderTest{manager: &SyncManager{peerStateManager: states}}
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	waitForConnectionState(t, ctx, peer, &v1.Multihost_Peer{Keyid: identity1.Keyid, InstanceId: defaultHostID}, state.ConnectionState)
+}
+
+func TestSyncManagerCancellationJoinsClients(t *testing.T) {
+	testutil.InstallZapLogger(t)
+	listener := listenSyncAPI(t, "127.0.0.1:0")
+	peer := newPeerUnderTest(t, &v1.Config{
+		Version: migrations.CurrentVersion, Instance: defaultClientID,
+		Multihost: &v1.Multihost{Identity: identity2, KnownHosts: []*v1.Multihost_Peer{{
+			Keyid: identity1.Keyid, InstanceId: defaultHostID,
+			InstanceUrl: "http://" + listener.Addr().String(),
+		}}},
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	done := make(chan struct{})
+	go func() { defer close(done); peer.manager.RunSync(ctx) }()
+	t.Cleanup(func() { cancel(); <-done })
+	testutil.Try(t, ctx, func() error {
+		if len(peer.manager.GetSyncClients()) != 1 {
+			return errors.New("client has not started")
+		}
+		return nil
+	})
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("sync manager did not stop its client")
+	}
+	if len(peer.manager.GetSyncClients()) != 0 {
+		t.Fatal("sync manager returned before its child client exited")
+	}
+}
+
+func runSyncAPIWithCtx(ctx context.Context, peer *peerUnderTest, listener net.Listener) {
 	mux := http.NewServeMux()
 	syncHandler := NewBackrestSyncHandler(peer.manager)
 	mux.Handle(v1syncconnect.NewBackrestSyncServiceHandler(syncHandler))
 
 	server := &http.Server{
-		Addr:    bindAddr,
 		Handler: h2c.NewHandler(mux, &http2.Server{}), // h2c is HTTP/2 without TLS for grpc-connect support.
 	}
 
@@ -705,7 +782,7 @@ func runSyncAPIWithCtx(ctx context.Context, peer *peerUnderTest, bindAddr string
 
 	wg.Add(1)
 	go func() {
-		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		if err := server.Serve(listener); err != nil && err != http.ErrServerClosed {
 			panic(err)
 		}
 		wg.Done()
@@ -720,11 +797,12 @@ func runSyncAPIWithCtx(ctx context.Context, peer *peerUnderTest, bindAddr string
 	wg.Wait()
 }
 
-func startRunningSyncAPI(t *testing.T, peer *peerUnderTest, bindAddr string) {
+func startRunningSyncAPI(t *testing.T, peer *peerUnderTest, listener net.Listener) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
-	t.Cleanup(cancel)
-	go runSyncAPIWithCtx(ctx, peer, bindAddr)
+	done := make(chan struct{})
+	t.Cleanup(func() { cancel(); <-done })
+	go func() { defer close(done); runSyncAPIWithCtx(ctx, peer, listener) }()
 }
 
 type peerUnderTest struct {

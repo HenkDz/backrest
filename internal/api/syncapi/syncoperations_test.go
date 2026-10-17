@@ -27,17 +27,18 @@ func TestFuzzOperationSync(t *testing.T) {
 	testutil.InstallZapLogger(t)
 
 	const (
-		numRounds      = 10  // rounds of mutations
-		opsPerRound    = 20  // mutations per round
-		reconnectEvery = 3   // force reconnect every N rounds
+		numRounds      = 10 // rounds of mutations
+		opsPerRound    = 20 // mutations per round
+		reconnectEvery = 3  // force reconnect every N rounds
 		testTimeout    = 60 * time.Second
 	)
 
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	peerHostAddr := testutil.AllocOpenBindAddr(t)
-	peerClientAddr := testutil.AllocOpenBindAddr(t)
+	peerHostListener := listenSyncAPI(t, "127.0.0.1:0")
+	peerHostAddr := peerHostListener.Addr().String()
+	peerClientListener := listenSyncAPI(t, "127.0.0.1:0")
 
 	repoGUID := cryptoutil.MustRandomID(cryptoutil.DefaultIDBits)
 
@@ -103,10 +104,14 @@ func TestFuzzOperationSync(t *testing.T) {
 	syncCtx, cancelSync := context.WithCancel(ctx)
 	var syncWg sync.WaitGroup
 	startSync := func() {
+		if syncCtx.Err() != nil {
+			peerHostListener = listenSyncAPI(t, peerHostAddr)
+			peerClientListener = listenSyncAPI(t, peerClientListener.Addr().String())
+		}
 		syncCtx, cancelSync = context.WithCancel(ctx)
 		syncWg.Add(2)
-		go func() { defer syncWg.Done(); runSyncAPIWithCtx(syncCtx, peerHost, peerHostAddr) }()
-		go func() { defer syncWg.Done(); runSyncAPIWithCtx(syncCtx, peerClient, peerClientAddr) }()
+		go func() { defer syncWg.Done(); runSyncAPIWithCtx(syncCtx, peerHost, peerHostListener) }()
+		go func() { defer syncWg.Done(); runSyncAPIWithCtx(syncCtx, peerClient, peerClientListener) }()
 		tryConnect(t, ctx, peerClient, peerClientConfig.Multihost.KnownHosts[0])
 	}
 	stopSync := func() {
@@ -196,8 +201,9 @@ func TestFuzzOperationSyncOfflineMutations(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), testTimeout)
 	defer cancel()
 
-	peerHostAddr := testutil.AllocOpenBindAddr(t)
-	peerClientAddr := testutil.AllocOpenBindAddr(t)
+	peerHostListener := listenSyncAPI(t, "127.0.0.1:0")
+	peerHostAddr := peerHostListener.Addr().String()
+	peerClientListener := listenSyncAPI(t, "127.0.0.1:0")
 
 	repoGUID := cryptoutil.MustRandomID(cryptoutil.DefaultIDBits)
 
@@ -251,8 +257,8 @@ func TestFuzzOperationSyncOfflineMutations(t *testing.T) {
 	syncCtx, cancelSync := context.WithCancel(ctx)
 	var syncWg sync.WaitGroup
 	syncWg.Add(2)
-	go func() { defer syncWg.Done(); runSyncAPIWithCtx(syncCtx, peerHost, peerHostAddr) }()
-	go func() { defer syncWg.Done(); runSyncAPIWithCtx(syncCtx, peerClient, peerClientAddr) }()
+	go func() { defer syncWg.Done(); runSyncAPIWithCtx(syncCtx, peerHost, peerHostListener) }()
+	go func() { defer syncWg.Done(); runSyncAPIWithCtx(syncCtx, peerClient, peerClientListener) }()
 	tryConnect(t, ctx, peerClient, peerClientConfig.Multihost.KnownHosts[0])
 
 	for i := 0; i < initialOps; i++ {
@@ -298,10 +304,12 @@ func TestFuzzOperationSyncOfflineMutations(t *testing.T) {
 	}
 
 	// Phase 3: reconnect and verify convergence
+	peerHostListener = listenSyncAPI(t, peerHostAddr)
+	peerClientListener = listenSyncAPI(t, peerClientListener.Addr().String())
 	syncCtx, cancelSync = context.WithCancel(ctx)
 	syncWg.Add(2)
-	go func() { defer syncWg.Done(); runSyncAPIWithCtx(syncCtx, peerHost, peerHostAddr) }()
-	go func() { defer syncWg.Done(); runSyncAPIWithCtx(syncCtx, peerClient, peerClientAddr) }()
+	go func() { defer syncWg.Done(); runSyncAPIWithCtx(syncCtx, peerHost, peerHostListener) }()
+	go func() { defer syncWg.Done(); runSyncAPIWithCtx(syncCtx, peerClient, peerClientListener) }()
 	tryConnect(t, ctx, peerClient, peerClientConfig.Multihost.KnownHosts[0])
 
 	assertOpsConverge(t, ctx, peerClient, peerHost, query, "after offline mutations")
